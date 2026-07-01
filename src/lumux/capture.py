@@ -41,6 +41,7 @@ class ScreenCapture:
 
         self._restore_token = restore_token or None
         self._on_restore_token = on_restore_token
+        self._token_rejected = False
 
         self._portal_node_id: Optional[int] = None
         self._portal_session_handle: Optional[str] = None
@@ -196,15 +197,17 @@ class ScreenCapture:
         return screen
 
     def _setup_portal_session(self) -> bool:
-        had_token = bool(self._restore_token)
+        self._token_rejected = False
         if self._try_setup_portal_session():
             return True
-        if had_token:
-            # A stored token can make SelectSources fail hard (e.g. GNOME
-            # rejects malformed tokens with InvalidArgument) rather than
-            # being gracefully ignored per spec. Clear it and try once
-            # more without, so a corrupted token can't wedge sync forever.
-            print("Portal setup failed with stored restore token; clearing it and retrying")
+        if self._token_rejected:
+            # GNOME's portal rejects malformed restore tokens with a hard
+            # InvalidArgument error from SelectSources itself, rather than
+            # gracefully ignoring them per spec. Clear the bad token and
+            # try once more without it, so a corrupted token can't wedge
+            # sync forever. Failures the token can't have caused
+            # (CreateSession, user cancel, Start) must NOT clear it.
+            print("Portal rejected stored restore token; clearing and retrying")
             self._restore_token = None
             if self._on_restore_token:
                 self._on_restore_token("")
@@ -284,10 +287,15 @@ class ScreenCapture:
                 )
 
             loop = GLib.MainLoop()
-            req = screencast.SelectSources(
-                self._portal_session_handle,
-                select_sources_options,
-            )
+            try:
+                req = screencast.SelectSources(
+                    self._portal_session_handle,
+                    select_sources_options,
+                )
+            except Exception:
+                if "restore_token" in select_sources_options:
+                    self._token_rejected = True
+                raise
             sub = bus.con.signal_subscribe(
                 None,
                 "org.freedesktop.portal.Request",

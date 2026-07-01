@@ -41,7 +41,14 @@ class FakeScreenCast:
         def _deliver():
             callback = self._connection.subscriptions.get(path)
             if callback is not None:
-                callback(None, None, path, "org.freedesktop.portal.Request", "Response", (code, results))
+                callback(
+                    None,
+                    None,
+                    path,
+                    "org.freedesktop.portal.Request",
+                    "Response",
+                    (code, results),
+                )
             return False
 
         GLib.idle_add(_deliver)
@@ -101,7 +108,8 @@ def test_select_sources_includes_stored_restore_token():
 
 def test_new_restore_token_is_saved_via_callback():
     screencast = FakeScreenCast(
-        None, _responses(start_results={"streams": [(42, {})], "restore_token": "NEW-TOKEN"})
+        None,
+        _responses(start_results={"streams": [(42, {})], "restore_token": "NEW-TOKEN"}),
     )
     saved_tokens = []
 
@@ -119,7 +127,10 @@ def test_new_restore_token_is_saved_via_callback():
 
 def test_unchanged_restore_token_does_not_trigger_callback():
     screencast = FakeScreenCast(
-        None, _responses(start_results={"streams": [(42, {})], "restore_token": "SAME-TOKEN"})
+        None,
+        _responses(
+            start_results={"streams": [(42, {})], "restore_token": "SAME-TOKEN"}
+        ),
     )
     saved_tokens = []
 
@@ -150,7 +161,8 @@ class FailOnTokenScreenCast(FakeScreenCast):
 
 def test_malformed_token_failure_clears_token_and_retries_without_it():
     screencast = FailOnTokenScreenCast(
-        None, _responses(start_results={"streams": [(42, {})], "restore_token": "FRESH"})
+        None,
+        _responses(start_results={"streams": [(42, {})], "restore_token": "FRESH"}),
     )
     saved_tokens = []
 
@@ -168,6 +180,50 @@ def test_malformed_token_failure_clears_token_and_retries_without_it():
     # Token was cleared (""), then the fresh one from the retry was saved
     assert saved_tokens == ["", "FRESH"]
     assert capture._restore_token == "FRESH"
+
+
+class FailOnCreateSessionScreenCast(FakeScreenCast):
+    """Raises on CreateSession, before any restore token is ever sent."""
+
+    def CreateSession(self, options):
+        raise Exception("portal unavailable")
+
+
+def test_create_session_failure_preserves_stored_token():
+    screencast = FailOnCreateSessionScreenCast(None, _responses(start_results={}))
+    saved_tokens = []
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture = ScreenCapture(
+            source_type="screen",
+            restore_token="VALID-TOKEN",
+            on_restore_token=saved_tokens.append,
+        )
+        assert capture._setup_portal_session() is False
+
+    # The token was never sent, so it must not be cleared and no retry
+    # (which would clear it) may happen.
+    assert capture._restore_token == "VALID-TOKEN"
+    assert saved_tokens == []
+    assert screencast.select_sources_calls == []
+
+
+def test_first_ever_token_fires_callback():
+    screencast = FakeScreenCast(
+        None,
+        _responses(start_results={"streams": [(42, {})], "restore_token": "FIRST"}),
+    )
+    saved_tokens = []
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture = ScreenCapture(
+            source_type="screen",
+            on_restore_token=saved_tokens.append,
+        )
+        assert capture._setup_portal_session() is True
+
+    assert saved_tokens == ["FIRST"]
+    assert capture._restore_token == "FIRST"
 
 
 def test_failure_without_stored_token_does_not_retry():
