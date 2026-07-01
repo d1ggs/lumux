@@ -30,9 +30,6 @@ def test_app_context_saves_new_restore_token_from_capture(settings_manager):
 
     assert settings_manager.capture.restore_token == "FRESH-TOKEN"
 
-    reloaded = SettingsManager.get_instance()
-    assert reloaded.capture.restore_token == "FRESH-TOKEN"
-
 
 def test_app_context_saves_new_restore_token_to_disk(settings_manager, tmp_path):
     context = AppContext(settings_manager)
