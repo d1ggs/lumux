@@ -2,7 +2,7 @@
 
 import time
 import threading
-from typing import Optional, List, TYPE_CHECKING
+from typing import Callable, Optional, List, TYPE_CHECKING
 
 import numpy as np
 
@@ -19,6 +19,12 @@ if TYPE_CHECKING:
 
 Gst.init(None)
 
+# xdg-desktop-portal ScreenCast persist_mode values (portal interface v4+).
+# PERSIST_UNTIL_REVOKED keeps the grant across app restarts and reboots
+# until the user revokes it (e.g. GNOME Settings > Privacy > Screen
+# Sharing), so the monitor picker only needs to be shown once.
+_PERSIST_UNTIL_REVOKED = 2
+
 
 class ScreenCapture:
     def __init__(
@@ -26,10 +32,15 @@ class ScreenCapture:
         scale_factor: float = 0.125,
         black_bar_settings: Optional["BlackBarSettings"] = None,
         source_type: str = "screen",
+        restore_token: Optional[str] = None,
+        on_restore_token: Optional[Callable[[str], None]] = None,
     ):
         self.scale_factor = scale_factor
         self.source_type = source_type
         self._display = None
+
+        self._restore_token = restore_token or None
+        self._on_restore_token = on_restore_token
 
         self._portal_node_id: Optional[int] = None
         self._portal_session_handle: Optional[str] = None
@@ -198,7 +209,12 @@ class ScreenCapture:
             screencast = portal["org.freedesktop.portal.ScreenCast"]
 
             loop = GLib.MainLoop()
-            state = {"session_handle": None, "node_id": None, "error": None}
+            state = {
+                "session_handle": None,
+                "node_id": None,
+                "error": None,
+                "restore_token": None,
+            }
 
             def on_response(connection, sender, object, interface, signal, params):
                 code, results = params
@@ -212,6 +228,7 @@ class ScreenCapture:
                     loop.quit()
                 elif "streams" in results:
                     state["node_id"] = results["streams"][0][0]
+                    state["restore_token"] = results.get("restore_token")
                     loop.quit()
                 else:
                     loop.quit()
@@ -240,13 +257,20 @@ class ScreenCapture:
             self._portal_session_handle = state["session_handle"]
 
             portal_types = 1 if self.source_type == "screen" else 2
+            select_sources_options = {
+                "types": GLib.Variant("u", portal_types),
+                "multiple": GLib.Variant("b", False),
+                "persist_mode": GLib.Variant("u", _PERSIST_UNTIL_REVOKED),
+            }
+            if self._restore_token:
+                select_sources_options["restore_token"] = GLib.Variant(
+                    "s", self._restore_token
+                )
+
             loop = GLib.MainLoop()
             req = screencast.SelectSources(
                 self._portal_session_handle,
-                {
-                    "types": GLib.Variant("u", portal_types),
-                    "multiple": GLib.Variant("b", False),
-                },
+                select_sources_options,
             )
             sub = bus.con.signal_subscribe(
                 None,
@@ -281,6 +305,13 @@ class ScreenCapture:
             if state["node_id"]:
                 self._portal_node_id = state["node_id"]
                 print(f"Portal session started. PipeWire node: {self._portal_node_id}")
+
+                new_token = state["restore_token"]
+                if new_token and new_token != self._restore_token:
+                    self._restore_token = new_token
+                    if self._on_restore_token:
+                        self._on_restore_token(new_token)
+
                 return True
 
         except Exception as e:
