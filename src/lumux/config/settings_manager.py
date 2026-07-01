@@ -1,6 +1,8 @@
 """Settings management for Hue Sync application."""
 
 import json
+import tempfile
+import threading
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional, List
@@ -101,6 +103,7 @@ class SettingsManager:
         self._settings = Settings()
         self._config_dir = self._get_config_dir()
         self._settings_file = self._config_dir / "settings.json"
+        self._save_lock = threading.Lock()
         self._load_settings()
 
     def _get_config_dir(self) -> Path:
@@ -125,7 +128,7 @@ class SettingsManager:
     @property
     def hue(self) -> HueSettings:
         return self._settings.hue
-    
+
     @property
     def capture(self) -> CaptureSettings:
         return self._settings.capture
@@ -195,22 +198,45 @@ class SettingsManager:
         self._validate_settings()
 
     def save(self):
-        """Save settings to config file."""
-        self._ensure_config_dir()
-        self._validate_settings()
+        """Save settings to config file.
 
-        data = {
-            "hue": asdict(self._settings.hue),
-            "capture": asdict(self._settings.capture),
-            "zones": asdict(self._settings.zones),
-            "sync": asdict(self._settings.sync),
-            "ui": asdict(self._settings.ui),
-            "black_bar": asdict(self._settings.black_bar),
-            "reading_mode": asdict(self._settings.reading_mode),
-        }
+        Thread-safe: the sync thread (restore_token callback) and the GTK
+        main thread (GUI) both save; the lock serializes writers and the
+        temp-file + os.replace write keeps settings.json atomic so a
+        concurrent save can never leave a corrupt file behind.
+        """
+        with self._save_lock:
+            self._ensure_config_dir()
+            self._validate_settings()
 
-        with open(self._settings_file, "w") as f:
-            json.dump(data, f, indent=2)
+            data = {
+                "hue": asdict(self._settings.hue),
+                "capture": asdict(self._settings.capture),
+                "zones": asdict(self._settings.zones),
+                "sync": asdict(self._settings.sync),
+                "ui": asdict(self._settings.ui),
+                "black_bar": asdict(self._settings.black_bar),
+                "reading_mode": asdict(self._settings.reading_mode),
+            }
+
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w",
+                dir=self._config_dir,
+                prefix="settings.",
+                suffix=".tmp",
+                delete=False,
+            )
+            try:
+                with tmp:
+                    json.dump(data, tmp, indent=2)
+                    tmp.flush()
+                os.replace(tmp.name, self._settings_file)
+            except BaseException:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+                raise
 
     def _validate_settings(self):
         """Validate and clamp settings to valid ranges."""
@@ -219,6 +245,8 @@ class SettingsManager:
         )
         if self._settings.capture.source_type not in ("screen", "window"):
             self._settings.capture.source_type = "screen"
+        if not isinstance(self._settings.capture.restore_token, str):
+            self._settings.capture.restore_token = ""
         self._settings.sync.fps = max(1, min(60, self._settings.sync.fps))
         self._settings.sync.transition_time_ms = max(
             0, min(1000, self._settings.sync.transition_time_ms)
