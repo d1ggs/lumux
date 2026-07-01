@@ -26,7 +26,6 @@ ENV/
 env/
 .venv/
 venv.bak/
-uv.lock
 
 # Pytest
 .pytest_cache/
