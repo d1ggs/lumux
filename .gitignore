@@ -67,6 +67,9 @@ Thumbs.db
 # Git worktrees (superpowers:using-git-worktrees)
 .worktrees/
 
+# Subagent-driven-development progress ledger (superpowers)
+.superpowers/
+
 # Flatpak build
 flatpak/build/
 flatpak/.flatpak-builder/
