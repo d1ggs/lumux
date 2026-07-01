@@ -132,3 +132,53 @@ def test_unchanged_restore_token_does_not_trigger_callback():
         assert capture._setup_portal_session() is True
 
     assert saved_tokens == []
+
+
+class FailOnTokenScreenCast(FakeScreenCast):
+    """Raises on SelectSources when a restore_token is present, mimicking
+    GNOME's hard InvalidArgument failure on malformed tokens."""
+
+    def SelectSources(self, session_handle, options):
+        self.select_sources_calls.append(options)
+        if "restore_token" in options:
+            raise Exception(
+                "GDBus.Error:org.freedesktop.portal.Error.InvalidArgument: "
+                "Restore token is not a valid UUID string (36)"
+            )
+        return self._fire_response("SelectSources")
+
+
+def test_malformed_token_failure_clears_token_and_retries_without_it():
+    screencast = FailOnTokenScreenCast(
+        None, _responses(start_results={"streams": [(42, {})], "restore_token": "FRESH"})
+    )
+    saved_tokens = []
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture = ScreenCapture(
+            source_type="screen",
+            restore_token="corrupted-not-a-uuid",
+            on_restore_token=saved_tokens.append,
+        )
+        assert capture._setup_portal_session() is True
+
+    # First attempt carried the bad token, retry did not
+    assert "restore_token" in screencast.select_sources_calls[0]
+    assert "restore_token" not in screencast.select_sources_calls[1]
+    # Token was cleared (""), then the fresh one from the retry was saved
+    assert saved_tokens == ["", "FRESH"]
+    assert capture._restore_token == "FRESH"
+
+
+def test_failure_without_stored_token_does_not_retry():
+    class AlwaysFailScreenCast(FakeScreenCast):
+        def SelectSources(self, session_handle, options):
+            self.select_sources_calls.append(options)
+            raise Exception("portal unavailable")
+
+    screencast = AlwaysFailScreenCast(None, _responses(start_results={}))
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture = ScreenCapture(source_type="screen")
+        assert capture._setup_portal_session() is False
+
+    assert len(screencast.select_sources_calls) == 1

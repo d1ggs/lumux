@@ -196,6 +196,22 @@ class ScreenCapture:
         return screen
 
     def _setup_portal_session(self) -> bool:
+        had_token = bool(self._restore_token)
+        if self._try_setup_portal_session():
+            return True
+        if had_token:
+            # A stored token can make SelectSources fail hard (e.g. GNOME
+            # rejects malformed tokens with InvalidArgument) rather than
+            # being gracefully ignored per spec. Clear it and try once
+            # more without, so a corrupted token can't wedge sync forever.
+            print("Portal setup failed with stored restore token; clearing it and retrying")
+            self._restore_token = None
+            if self._on_restore_token:
+                self._on_restore_token("")
+            return self._try_setup_portal_session()
+        return False
+
+    def _try_setup_portal_session(self) -> bool:
         try:
             import pydbus
 
