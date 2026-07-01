@@ -64,6 +64,9 @@ Thumbs.db
 # Ruff linter
 .ruff_cache/
 
+# Git worktrees (superpowers:using-git-worktrees)
+.worktrees/
+
 # Flatpak build
 flatpak/build/
 flatpak/.flatpak-builder/
