@@ -1,6 +1,16 @@
 # Lumux — Philips Hue Sync for Wayland
 
-[![Flathub](https://flathub.org/api/badge?locale=en)](https://flathub.org/apps/io.github.enginkirmaci.lumux)
+> **This is a fork** of [enginkirmaci/lumux](https://github.com/enginkirmaci/lumux) by
+> [Engin Kırmacı](https://github.com/enginkirmaci), who created Lumux and deserves
+> all credit for the app itself. This fork adds **screen-share permission persistence**:
+> upstream Lumux asks "which monitor to share?" on every launch, because the
+> xdg-desktop-portal grant is never remembered. This fork implements the portal's
+> `persist_mode`/`restore_token` mechanism, so you're asked **once** and sync starts
+> silently on every subsequent launch — including autostart at login.
+>
+> Install this fork's flatpak from the [Releases page](../../releases) **instead of**
+> the Flathub build (see [Install](#install) below). Same app ID, so it cleanly
+> replaces/shadows the Flathub install.
 
 Real-time ambient lighting synchronization for Philips Hue lights on Linux (Wayland) using a GTK4/Adwaita interface.
 
@@ -20,19 +30,33 @@ Real-time ambient lighting synchronization for Philips Hue lights on Linux (Wayl
 
 ## Install
 
-### Flathub (Recommended)
+### This fork's flatpak (Recommended)
+
+Download `lumux-vX.Y.Z.flatpak` from the [Releases page](../../releases), then:
+
+```bash
+flatpak install --user ./lumux-vX.Y.Z.flatpak
+```
+
+It uses the same app ID as the Flathub build, so a `--user` install takes
+priority over (and cleanly coexists with) a system-scope Flathub install —
+`flatpak run io.github.enginkirmaci.lumux` and any autostart entry pick up
+this build automatically. To go back to upstream:
+`flatpak uninstall --user io.github.enginkirmaci.lumux`.
+
+### Upstream Flathub build
+
+The original, without permission persistence (re-prompts every launch):
 
 ```bash
 flatpak install flathub io.github.enginkirmaci.lumux
 ```
 
-Or install from [Flathub](https://flathub.org/apps/io.github.enginkirmaci.lumux)
-
 ### From Source
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/enginkirmaci/lumux.git
+git clone https://github.com/d1ggs/lumux.git
 cd lumux
 ```
 
@@ -138,5 +162,7 @@ MIT License
 
 ## Acknowledgements / Notes
 
+- Lumux is created and maintained by [Engin Kırmacı](https://github.com/enginkirmaci) —
+  this fork only adds portal permission persistence on top of his work
 - Works with Hue v2 API library (python-hue-v2)
 - Screen capture on Wayland depends on the compositor and the portal implementation
