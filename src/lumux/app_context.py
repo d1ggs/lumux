@@ -33,6 +33,8 @@ class AppContext:
             scale_factor=settings.capture.scale_factor,
             black_bar_settings=settings.black_bar,
             source_type=settings.capture.source_type,
+            restore_token=settings.capture.restore_token,
+            on_restore_token=self._save_restore_token,
         )
         self.zone_processor = ZoneProcessor(settings=settings.zones)
         self.color_analyzer = ColorAnalyzer(
@@ -72,6 +74,11 @@ class AppContext:
         )
 
         self._settings_lock = threading.Lock()
+
+    def _save_restore_token(self, token: str) -> None:
+        """Persist a new/rotated ScreenCast restore_token from the portal."""
+        self.settings.capture.restore_token = token
+        self.settings.save()
 
     def start(self) -> BridgeStatus:
         """Start background workers and attempt bridge connection."""
