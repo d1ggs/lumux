@@ -372,6 +372,24 @@ class EntertainmentStream:
                 print(f"Error sending colors: {e}")
                 self._connected = False
 
+    def blackout(self) -> None:
+        """Send a black (0,0,0) frame to every channel immediately.
+
+        The lamp freezes at its last streamed color for the whole suspend,
+        so streaming black over the already-open DTLS socket makes it
+        visually dark regardless of any REST-layer race - fire-and-forget
+        write to the local openssl subprocess stdin, no network timeout
+        semantics involved. Guarded by is_connected(); non-fatal on error,
+        same as send_colors().
+        """
+        if not self.is_connected():
+            return
+
+        try:
+            self.send_colors({ch: (0.0, 0.0, 0.0, 0.0) for ch in self._channels})
+        except Exception as e:
+            print(f"Error sending blackout: {e}")
+
     def send_colors_xy(
         self, channel_colors: Dict[int, Tuple[Tuple[float, float], int]]
     ) -> None:

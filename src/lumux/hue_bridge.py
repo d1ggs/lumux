@@ -182,7 +182,9 @@ class HueBridge:
         except BridgeError as e:
             print(f"Error refreshing spatial data: {e}")
 
-    def resolve_light_ids(self, entertainment_rids: List[str]) -> List[str]:
+    def resolve_light_ids(
+        self, entertainment_rids: List[str], timeout: Optional[float] = None
+    ) -> List[str]:
         """Resolve entertainment-service resource IDs to light resource IDs.
 
         `entertainment_stream.light_to_channel` (and the entertainment
@@ -203,7 +205,7 @@ class HueBridge:
             return []
 
         try:
-            devices = self.client.get_devices()
+            devices = self.client.get_devices(timeout=timeout)
 
             light_ids: List[str] = []
             for device in devices:
@@ -582,17 +584,24 @@ class HueBridge:
             print(f"Failed to activate streaming: {e}")
             return False
 
-    def deactivate_entertainment_streaming(self, config_id: str) -> bool:
+    def deactivate_entertainment_streaming(
+        self, config_id: str, timeout: Optional[float] = None
+    ) -> bool:
         """Deactivate entertainment streaming for a configuration."""
         if not self.client:
             return False
 
         try:
-            if self.client.deactivate_entertainment_streaming(config_id):
+            if self.client.deactivate_entertainment_streaming(
+                config_id, timeout=timeout
+            ):
                 timed_print(
                     f"Entertainment streaming deactivated for config {config_id}"
                 )
                 return True
+            timed_print(
+                f"Entertainment streaming deactivate returned False for config {config_id}"
+            )
             return False
         except BridgeError as e:
             print(f"Failed to deactivate streaming: {e}")

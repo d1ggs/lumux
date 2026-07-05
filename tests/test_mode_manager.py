@@ -7,9 +7,15 @@ class FakeSyncController:
     registered stop callback, exactly like the real thing does after
     joining its sync thread (see SyncController.stop() in sync.py)."""
 
-    def __init__(self):
+    def __init__(self, events=None):
         self._running = False
         self._on_stop_callback = None
+        self._send_paused = False
+        # Order-recording list, shared with FakeEntertainmentStream/
+        # FakeBridge/FakeBridgeClient when constructed by _make_manager, so
+        # tests can assert the relative order of pause_sending/blackout/
+        # deactivate/set_light_state/disconnect calls.
+        self.events = events if events is not None else []
 
     def set_on_stop_callback(self, callback):
         self._on_stop_callback = callback
@@ -19,6 +25,7 @@ class FakeSyncController:
 
     def start(self):
         self._running = True
+        self._send_paused = False
 
     def stop(self):
         if not self._running:
@@ -26,6 +33,10 @@ class FakeSyncController:
         self._running = False
         if self._on_stop_callback:
             self._on_stop_callback()
+
+    def pause_sending(self):
+        self._send_paused = True
+        self.events.append(("pause_sending",))
 
 
 class FakeEntertainmentStream:
@@ -53,15 +64,20 @@ class FakeEntertainmentStream:
         self._connected = False
         self.events.append(("disconnect",))
 
+    def blackout(self):
+        self.events.append(("blackout",))
+
 
 class FakeBridgeClient:
     def __init__(self, events=None):
         self.calls = []
+        self.timeouts = []
         self.events = events if events is not None else []
 
-    def set_light_state(self, light_id, payload):
+    def set_light_state(self, light_id, payload, timeout=None):
         self.calls.append((light_id, payload))
-        self.events.append(("set_light_state", light_id, payload))
+        self.timeouts.append(timeout)
+        self.events.append(("set_light_state", light_id, payload, timeout))
 
 
 class FakeBridge:
@@ -81,7 +97,7 @@ class FakeBridge:
         self.resolve_light_ids_calls = 0
         self.deactivate_calls = []
 
-    def resolve_light_ids(self, entertainment_rids):
+    def resolve_light_ids(self, entertainment_rids, timeout=None):
         self.resolve_light_ids_calls += 1
         return [
             self.ENTERTAINMENT_TO_LIGHT[rid]
@@ -89,9 +105,9 @@ class FakeBridge:
             if rid in self.ENTERTAINMENT_TO_LIGHT
         ]
 
-    def deactivate_entertainment_streaming(self, config_id):
+    def deactivate_entertainment_streaming(self, config_id, timeout=None):
         self.deactivate_calls.append(config_id)
-        self.events.append(("deactivate_entertainment_streaming", config_id))
+        self.events.append(("deactivate_entertainment_streaming", config_id, timeout))
         return True
 
 
@@ -120,8 +136,8 @@ def _make_manager(monkeypatch, auto_activate=True, light_to_channel=None):
     in for the sync controller, entertainment stream, bridge, and reading
     controller, and with GLib.timeout_add captured instead of actually
     scheduled so tests can fire the pending callback manually."""
-    sync_controller = FakeSyncController()
     events = []
+    sync_controller = FakeSyncController(events=events)
     entertainment_stream = FakeEntertainmentStream(
         connected=True, light_to_channel=light_to_channel, events=events
     )
@@ -321,19 +337,22 @@ def test_turn_off_without_turn_off_lights_sends_no_off_commands(monkeypatch):
 
 
 def test_turn_off_urgent_sends_lights_off_before_network_teardown(monkeypatch):
-    """Task 13 regression: live suspend testing showed NetworkManager tears
-    the network down in parallel with our suspend handler (the logind delay
-    inhibitor only delays suspend *entry*, not NetworkManager), so the
-    Task 12 code path ran but lost the race - by the time turn_off() reached
-    resolve_light_ids() ~5s later (after switch_to_reading()'s full inline
-    disconnect), the network was already gone.
+    """Task 14 regression: the Task 13 reordering still lost the race on
+    live suspend test #4 - every REST failure in the chain is silent
+    (`except BridgeError: return False`, no log), and sync_controller.stop()
+    (thread join + portal Close()) plus the deactivate PUT's default 5s
+    timeout meant the off commands went out long after the network window
+    closed, with no error logged to explain why.
 
-    urgent=True must: (1) suppress the auto-activate-to-reading detour so
-    sync_controller.stop() returns immediately instead of running that ~5s
-    inline disconnect; (2) deactivate the entertainment session directly,
-    before any set_light_state call; (3) send the off loop using the ids
-    cached by switch_to_video() (no live resolve_light_ids() round-trip);
-    (4) send that off loop twice, 0.3s apart; (5) only then run the normal
+    urgent=True must now, in order: (1) suppress the auto-activate-to-reading
+    detour and pause the DTLS sender (sync_controller.pause_sending(), NOT
+    sync_controller.stop() - that expensive join/portal-close teardown is
+    deferred to the very end); (2) stream 3 black frames over the
+    already-open DTLS socket - immune to the REST/network race entirely;
+    (3) deactivate the entertainment session directly, with a short
+    timeout=2; (4) send the off loop (cached ids, no live
+    resolve_light_ids() round-trip) twice, 0.3s apart, also with
+    timeout=2; (5) only then run sync_controller.stop() and the normal
     stream disconnect."""
     manager, sync_controller, entertainment_stream, fake_reading, scheduled, bridge = (
         _make_manager(
@@ -363,9 +382,14 @@ def test_turn_off_urgent_sends_lights_off_before_network_teardown(monkeypatch):
     # The cache was used - zero live resolve_light_ids() round-trips.
     assert bridge.resolve_light_ids_calls == 0
 
-    # Ordering: deactivate first, then the off loop twice, then disconnect.
+    # Ordering: pause_sending, then 3 blackout frames, then deactivate,
+    # then the off loop twice, then disconnect.
     kinds = [event[0] for event in bridge.events]
     assert kinds == [
+        "pause_sending",
+        "blackout",
+        "blackout",
+        "blackout",
         "deactivate_entertainment_streaming",
         "set_light_state",
         "set_light_state",
@@ -373,7 +397,7 @@ def test_turn_off_urgent_sends_lights_off_before_network_teardown(monkeypatch):
         "set_light_state",
         "disconnect",
     ]
-    assert sleeps == [0.3]
+    assert sleeps == [0.1, 0.05, 0.05, 0.05, 0.3]
     assert sorted(bridge.client.calls) == sorted(
         [
             ("light-1", {"on": {"on": False}}),
@@ -381,6 +405,17 @@ def test_turn_off_urgent_sends_lights_off_before_network_teardown(monkeypatch):
         ]
         * 2
     )
+
+    # Every REST call in the urgent path must use the short 2s timeout,
+    # not the client's normal 5s default - this is the failure-is-loud-and-
+    # fast half of the fix.
+    deactivate_events = [
+        event
+        for event in bridge.events
+        if event[0] == "deactivate_entertainment_streaming"
+    ]
+    assert deactivate_events == [("deactivate_entertainment_streaming", "cfg-1", 2)]
+    assert bridge.client.timeouts == [2, 2, 2, 2]
 
 
 def test_switch_to_video_caches_resolved_light_ids(monkeypatch):
@@ -438,3 +473,9 @@ def test_turn_off_non_urgent_leaves_auto_activate_and_deactivate_untouched(
 
     # The normal path still resolves ids live (no cache populated here).
     assert bridge.resolve_light_ids_calls == 1
+
+    # The urgent-only DTLS blackout path must never fire on the normal
+    # (non-urgent) turn_off() - it still relies solely on disconnect().
+    kinds = [event[0] for event in bridge.events]
+    assert "pause_sending" not in kinds
+    assert "blackout" not in kinds

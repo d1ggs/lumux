@@ -281,15 +281,27 @@ class ModeManager:
             return False
         return result
 
-    def _send_lights_off(self, light_ids: List[str]) -> None:
+    def _send_lights_off(
+        self, light_ids: List[str], timeout: Optional[float] = None
+    ) -> None:
         """Send an explicit REST "off" command for each light id.
 
         Failures on individual lights are logged and otherwise ignored so
         one unreachable light doesn't stop the rest from being turned off.
+        set_light_state() itself never raises on a REST failure (it catches
+        BridgeError and returns False) - the bool return is checked here so
+        those failures are no longer silent; the try/except stays too, in
+        case of a non-BridgeError exception.
         """
         for light_id in light_ids:
             try:
-                self.bridge.client.set_light_state(light_id, {"on": {"on": False}})
+                ok = self.bridge.client.set_light_state(
+                    light_id, {"on": {"on": False}}, timeout=timeout
+                )
+                if not ok:
+                    timed_print(
+                        f"ModeManager: set_light_state returned False for light {light_id}"
+                    )
             except Exception as e:
                 timed_print(f"ModeManager: Failed to turn off light {light_id}: {e}")
 
@@ -338,39 +350,82 @@ class ModeManager:
             # (openssl subprocess terminate + wait(timeout=2), plus a REST
             # deactivate) before turn_off() gets a chance to send anything -
             # ~5s we don't have before NetworkManager takes the network down.
+            #
+            # Fourth live test: even with the Task 13 reordering, the lamp
+            # stayed ON - every REST failure in this chain is silent
+            # (`except BridgeError: return False`, no log), and the ~5s
+            # sync_controller.stop() (thread join + portal Close() D-Bus
+            # call) plus the deactivate PUT's 5s default timeout meant the
+            # off commands went out long after the network window closed.
+            # New order: pause the DTLS sender and stream black frames
+            # FIRST (immune to the network race - the lamp freezes at its
+            # last streamed color, so black = visually off), defer the
+            # expensive sync_controller.stop() teardown to the end, and
+            # give every REST call a short timeout with a logged result.
             try:
                 self._suppress_auto_activate = True
+
+                # Step 1: stop new color frames going out over the DTLS
+                # stream immediately. Unlike sync_controller.stop() (moved
+                # to the heavy teardown below), pause_sending() doesn't
+                # join the thread or close the capture pipeline - it takes
+                # effect within one frame period (~33ms).
+                timed_print("ModeManager: [urgent] pausing sync sender")
+                self.sync_controller.pause_sending()
+                time.sleep(0.1)  # let the in-flight frame drain
+
+                # Step 2: stream black frames over the already-open DTLS
+                # socket - the one channel immune to every REST/network
+                # race below. 3x with a short gap for margin against a
+                # dropped frame; lamp should be visually dark by ~T+0.4s.
+                if self.entertainment_stream:
+                    for i in range(3):
+                        timed_print(f"ModeManager: [urgent] blackout {i + 1}/3")
+                        self.entertainment_stream.blackout()
+                        time.sleep(0.05)
+
+                # Step 3: end the entertainment session immediately via a
+                # direct REST call (short timeout) so the bridge honors
+                # plain light commands again, without waiting for the full
+                # disconnect() teardown below.
+                if self.entertainment_stream:
+                    deactivated = self.bridge.deactivate_entertainment_streaming(
+                        self.entertainment_stream.entertainment_config_id,
+                        timeout=2,
+                    )
+                    timed_print(
+                        f"ModeManager: [urgent] deactivate_entertainment_streaming -> {deactivated}"
+                    )
+
+                # Step 4: off loop (cached ids) double-pass, 0.3s apart.
+                if turn_off_lights and (self._video_light_ids or entertainment_rids):
+                    light_ids = self._video_light_ids or self.bridge.resolve_light_ids(
+                        entertainment_rids
+                    )
+                    if light_ids:
+                        # Send the off loop twice, 0.3s apart: the bridge
+                        # needs ~1s after deactivation before REST commands
+                        # reliably take effect, but we can't afford a full
+                        # 1s wait here - two passes 0.3s apart is the best
+                        # effort within the network window.
+                        timed_print(
+                            f"ModeManager: [urgent] turning off {len(light_ids)} lights"
+                        )
+                        self._send_lights_off(light_ids, timeout=2)
+                        time.sleep(0.3)
+                        self._send_lights_off(light_ids, timeout=2)
+
+                # Step 5: heavy teardown, exactly as before - thread join /
+                # capture pipeline stop / portal Close(). The stop callback
+                # is still suppressed.
                 if self.sync_controller.is_running():
                     self.sync_controller.stop()
             finally:
                 self._suppress_auto_activate = False
 
-            # End the entertainment session immediately via a direct REST
-            # call so the bridge honors plain light commands again, without
-            # waiting for the full disconnect() teardown below.
-            if self.entertainment_stream:
-                self.bridge.deactivate_entertainment_streaming(
-                    self.entertainment_stream.entertainment_config_id
-                )
-
-            if turn_off_lights and (self._video_light_ids or entertainment_rids):
-                light_ids = self._video_light_ids or self.bridge.resolve_light_ids(
-                    entertainment_rids
-                )
-                if light_ids:
-                    # Send the off loop twice, 0.3s apart: the bridge needs
-                    # ~1s after deactivation before REST commands reliably
-                    # take effect, but we can't afford a full 1s wait here -
-                    # two passes 0.3s apart is the best effort within the
-                    # network window.
-                    timed_print(f"ModeManager: Turning off {len(light_ids)} lights")
-                    self._send_lights_off(light_ids)
-                    time.sleep(0.3)
-                    self._send_lights_off(light_ids)
-
-            # Normal teardown. The off-loop above already handled the
-            # light-off REST commands, so the shared end-of-teardown
-            # off-loop further below must not run again.
+            # The off-loop above already handled the light-off REST
+            # commands, so the shared end-of-teardown off-loop further
+            # below must not run again.
             if self.entertainment_stream and self.entertainment_stream.is_connected():
                 self.entertainment_stream.disconnect(self.bridge)
 

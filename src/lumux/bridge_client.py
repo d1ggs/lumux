@@ -170,20 +170,29 @@ class BridgeClient:
         except BridgeError:
             return None
 
-    def set_light_state(self, light_id: str, payload: Dict[str, Any]) -> bool:
+    def set_light_state(
+        self,
+        light_id: str,
+        payload: Dict[str, Any],
+        timeout: Optional[float] = None,
+    ) -> bool:
         """Update light state (color, brightness, on/off).
 
         Args:
             light_id: Light resource ID
             payload: Hue v2 API payload (color, dimming, on, dynamics, etc.)
+            timeout: Optional per-call timeout override in seconds
 
         Returns:
             True if successful
         """
         try:
-            self._request("PUT", f"/resource/light/{light_id}", json_data=payload)
+            self._request(
+                "PUT", f"/resource/light/{light_id}", json_data=payload, timeout=timeout
+            )
             return True
-        except BridgeError:
+        except BridgeError as e:
+            print(f"Error setting light state for {light_id}: {e}")
             return False
 
     def set_light_color(
@@ -318,23 +327,27 @@ class BridgeClient:
         except BridgeError:
             return False
 
-    def deactivate_entertainment_streaming(self, config_id: str) -> bool:
+    def deactivate_entertainment_streaming(
+        self, config_id: str, timeout: Optional[float] = None
+    ) -> bool:
         """Deactivate entertainment streaming for a configuration."""
         try:
             self._request(
                 "PUT",
                 f"/resource/entertainment_configuration/{config_id}",
                 json_data={"action": "stop"},
+                timeout=timeout,
             )
             return True
-        except BridgeError:
+        except BridgeError as e:
+            print(f"Error deactivating entertainment streaming for {config_id}: {e}")
             return False
 
     # === Device Operations ===
 
-    def get_devices(self) -> List[Dict[str, Any]]:
+    def get_devices(self, timeout: Optional[float] = None) -> List[Dict[str, Any]]:
         """Get all devices for spatial mapping."""
-        data = self._request("GET", "/resource/device")
+        data = self._request("GET", "/resource/device", timeout=timeout)
         return data.get("data", [])
 
     # === User Management ===

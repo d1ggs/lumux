@@ -39,6 +39,14 @@ class SyncController:
         self.queue: queue.Queue = queue.Queue(maxsize=100)
         self.lock = threading.Lock()
 
+        # Set by pause_sending() to skip sending new frames over the DTLS
+        # stream without stopping the capture/analyze loop or the thread
+        # itself - used by the urgent suspend path in ModeManager.turn_off()
+        # to stop new color frames from overwriting the blackout frames it
+        # streams directly, within one frame period (~33ms), without paying
+        # for the full stop() teardown (thread join + portal close).
+        self._send_paused = False
+
         # Zone to channel mapping for entertainment streaming
         self._zone_channel_map: Dict[str, int] = {}
 
@@ -60,6 +68,8 @@ class SyncController:
         """Start sync thread."""
         if self.running:
             return
+
+        self._send_paused = False
 
         # Build zone to channel mapping for entertainment streaming
         if self.entertainment_stream:
@@ -205,6 +215,16 @@ class SyncController:
         """Check if sync is running."""
         return self.running
 
+    def pause_sending(self):
+        """Stop sending new color frames without stopping the sync loop.
+
+        Capture/analyze keeps running (and start() resets this), but
+        _update_lights() skips the send_colors_xy() call - unlike stop(),
+        this doesn't join the thread or close the capture pipeline, so it
+        takes effect within one frame period instead of up to 3s.
+        """
+        self._send_paused = True
+
     def _sync_loop(self):
         """Main sync loop (runs in background thread)."""
         frame_times = []
@@ -335,8 +355,8 @@ class SyncController:
             else:
                 channel_colors[channel_id] = (xy, brightness)
 
-        # Send to all channels via DTLS
-        if channel_colors:
+        # Send to all channels via DTLS, unless pause_sending() was called
+        if channel_colors and not self._send_paused:
             self.entertainment_stream.send_colors_xy(channel_colors)
 
     def _queue_status(self, status_type: str, message, data=None):
