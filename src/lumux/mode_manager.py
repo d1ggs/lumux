@@ -159,6 +159,10 @@ class ModeManager:
                 list(self.entertainment_stream.light_to_channel.keys())
             )
         except Exception as e:
+            # Drop any cache from a previous session too - stale ids from a
+            # different entertainment area are worse than an empty cache,
+            # which at least falls back to a live resolve in turn_off().
+            self._video_light_ids = []
             timed_print(f"ModeManager: Error resolving light ids: {e}")
 
         timed_print("ModeManager: Now in VIDEO mode")
@@ -349,7 +353,7 @@ class ModeManager:
                     self.entertainment_stream.entertainment_config_id
                 )
 
-            if turn_off_lights:
+            if turn_off_lights and (self._video_light_ids or entertainment_rids):
                 light_ids = self._video_light_ids or self.bridge.resolve_light_ids(
                     entertainment_rids
                 )
