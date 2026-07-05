@@ -400,7 +400,7 @@ class ModeManager:
                 # Step 4: off loop (cached ids) double-pass, 0.3s apart.
                 if turn_off_lights and (self._video_light_ids or entertainment_rids):
                     light_ids = self._video_light_ids or self.bridge.resolve_light_ids(
-                        entertainment_rids
+                        entertainment_rids, timeout=2
                     )
                     if light_ids:
                         # Send the off loop twice, 0.3s apart: the bridge

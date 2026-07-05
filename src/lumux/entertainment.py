@@ -92,6 +92,11 @@ class EntertainmentStream:
         self._sequence = 0
         self._lock = threading.Lock()
 
+        # Set by blackout() so that a sync-thread frame already past its
+        # pause check cannot land after the final black frame and re-light
+        # the lamp during suspend. Cleared on (re)connect.
+        self._black_latched = False
+
         # Channel mappings
         self._channels: Dict[int, ChannelInfo] = {}
         self._light_to_channel: Dict[str, int] = {}
@@ -137,6 +142,7 @@ class EntertainmentStream:
                 return False
 
             self._connected = True
+            self._black_latched = False
             timed_print(
                 f"Entertainment stream connected with {len(self._channels)} channels"
             )
@@ -386,6 +392,12 @@ class EntertainmentStream:
             return
 
         try:
+            # Latch first (under the same lock the sync thread's
+            # send_colors_xy serializes on) so that black is guaranteed to
+            # be the final frame: any frame already past its pause check
+            # will be dropped by the latch instead of landing after us.
+            with self._lock:
+                self._black_latched = True
             self.send_colors({ch: (0.0, 0.0, 0.0, 0.0) for ch in self._channels})
         except Exception as e:
             print(f"Error sending blackout: {e}")
@@ -403,6 +415,8 @@ class EntertainmentStream:
             return
 
         with self._lock:
+            if self._black_latched:
+                return
             try:
                 message = self._build_xy_message(channel_colors)
                 self._send_dtls_message(message)
