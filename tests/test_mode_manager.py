@@ -32,10 +32,14 @@ class FakeEntertainmentStream:
     def __init__(self, connected=True, light_to_channel=None):
         self.entertainment_config_id = "cfg-1"
         self._connected = connected
+        # Keys are fake entertainment-*service* rids (not light rids) -
+        # mirrors the real EntertainmentStream.light_to_channel, which maps
+        # rtype: "entertainment" resource IDs to channel numbers. Resolving
+        # these to actual light rids is HueBridge.resolve_light_ids()'s job.
         self.light_to_channel = (
             light_to_channel
             if light_to_channel is not None
-            else {"light-1": 0, "light-2": 1}
+            else {"ent-1": 0, "ent-2": 1}
         )
 
     def is_connected(self):
@@ -54,8 +58,25 @@ class FakeBridgeClient:
 
 
 class FakeBridge:
+    """Fake HueBridge. resolve_light_ids() mirrors the real
+    HueBridge.resolve_light_ids(), translating entertainment-service rids
+    to light rids via a fixed fake mapping."""
+
+    ENTERTAINMENT_TO_LIGHT = {
+        "ent-1": "light-1",
+        "ent-2": "light-2",
+        "ent-3": "light-3",
+    }
+
     def __init__(self):
         self.client = FakeBridgeClient()
+
+    def resolve_light_ids(self, entertainment_rids):
+        return [
+            self.ENTERTAINMENT_TO_LIGHT[rid]
+            for rid in entertainment_rids
+            if rid in self.ENTERTAINMENT_TO_LIGHT
+        ]
 
 
 class FakeReadingController:
@@ -166,6 +187,48 @@ def test_turn_off_cancels_pending_reading_activation_armed_during_stop(monkeypat
     assert manager.current_mode == Mode.OFF
 
 
+def test_turn_off_turns_off_lights_even_when_auto_activate_disconnects_stream_first(
+    monkeypatch,
+):
+    """Regression test for Bug A (Task 12): with reading_mode.auto_activate
+    True and the entertainment stream connected, sync_controller.stop()
+    synchronously invokes on_video_sync_stopped() -> switch_to_reading(),
+    which itself disconnects the entertainment stream as a side effect -
+    before this fix, turn_off()'s light-off block was gated on
+    `entertainment_stream.is_connected()`, which was already False by the
+    time turn_off() reached it, so the lights were silently never turned
+    off (no "Turning off N lights" log line at all in the live re-test).
+    The rid capture must happen before sync_controller.stop() runs, and the
+    light-off loop must run regardless of who performed the disconnect."""
+    manager, sync_controller, entertainment_stream, fake_reading, scheduled, bridge = (
+        _make_manager(
+            monkeypatch,
+            auto_activate=True,
+            light_to_channel={"ent-1": 0, "ent-2": 1},
+        )
+    )
+
+    manager.current_mode = Mode.VIDEO
+    sync_controller.start()
+    assert entertainment_stream.is_connected()
+
+    result = manager.turn_off(turn_off_lights=True)
+    assert result is True
+
+    # switch_to_reading()'s synchronous stop callback disconnected the
+    # stream as a side effect, before turn_off()'s own connected-check ran.
+    assert not entertainment_stream.is_connected()
+
+    # The lights must still have been turned off via their resolved ids,
+    # captured before the stream was disconnected out from under turn_off().
+    assert sorted(bridge.client.calls) == sorted(
+        [
+            ("light-1", {"on": {"on": False}}),
+            ("light-2", {"on": {"on": False}}),
+        ]
+    )
+
+
 def test_switch_to_reading_still_activates_when_not_interrupted(monkeypatch):
     """Sanity check that the new guard doesn't break the normal path: a
     reading activation that is never cancelled should still complete when
@@ -200,7 +263,7 @@ def test_turn_off_sends_explicit_off_command_for_video_lights(monkeypatch):
         _make_manager(
             monkeypatch,
             auto_activate=False,
-            light_to_channel={"light-1": 0, "light-2": 1, "light-3": 2},
+            light_to_channel={"ent-1": 0, "ent-2": 1, "ent-3": 2},
         )
     )
 
@@ -211,6 +274,8 @@ def test_turn_off_sends_explicit_off_command_for_video_lights(monkeypatch):
     assert result is True
 
     assert not entertainment_stream.is_connected()
+    # set_light_state must be called with the *resolved* light rids, not
+    # the raw entertainment-service rids from light_to_channel.
     assert sorted(bridge.client.calls) == sorted(
         [
             ("light-1", {"on": {"on": False}}),

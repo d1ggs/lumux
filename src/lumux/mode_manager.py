@@ -262,6 +262,19 @@ class ModeManager:
         """
         timed_print("ModeManager: Turning OFF")
 
+        # Capture the entertainment rids this stream is driving *before*
+        # doing anything else. sync_controller.stop() below can
+        # synchronously invoke switch_to_reading() (via the auto-activate
+        # stop callback), which itself disconnects the entertainment
+        # stream as a side effect - if we captured light_to_channel after
+        # that point, it would already be gone and the light-off logic
+        # below would silently never run.
+        entertainment_rids = (
+            list(self.entertainment_stream.light_to_channel.keys())
+            if self.entertainment_stream
+            else []
+        )
+
         # Remember current mode before stopping sync
         mode_before = self.current_mode
 
@@ -299,17 +312,25 @@ class ModeManager:
             )
             return True
 
-        # Stop entertainment stream
+        # Stop entertainment stream if still connected. It may already have
+        # been disconnected as a side effect of switch_to_reading() above
+        # (Bug A) - the light-off logic below must run whether or not this
+        # call is the one that performs the disconnect, so the connected
+        # check only gates the disconnect() call itself.
         if self.entertainment_stream and self.entertainment_stream.is_connected():
-            # Capture the lights this stream was driving before disconnecting -
-            # disconnect() only tears down the DTLS/streaming connection, it
-            # never sends an explicit "off" REST command, so the lights would
-            # otherwise freeze at their last streamed color instead of
-            # turning off.
-            light_ids = list(self.entertainment_stream.light_to_channel.keys())
             self.entertainment_stream.disconnect(self.bridge)
 
-            if turn_off_lights and light_ids:
+        # disconnect() only tears down the DTLS/streaming connection, it
+        # never sends an explicit "off" REST command, so the lights would
+        # otherwise freeze at their last streamed color instead of turning
+        # off. entertainment_rids (captured at the top of this method,
+        # before anything could disconnect the stream) are entertainment
+        # *service* resource IDs, not light resource IDs - resolve() them
+        # via the bridge's device/service map (Bug B) before calling
+        # set_light_state().
+        if turn_off_lights and entertainment_rids:
+            light_ids = self.bridge.resolve_light_ids(entertainment_rids)
+            if light_ids:
                 timed_print(f"ModeManager: Turning off {len(light_ids)} lights")
                 for light_id in light_ids:
                     try:
