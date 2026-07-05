@@ -301,7 +301,25 @@ class ModeManager:
 
         # Stop entertainment stream
         if self.entertainment_stream and self.entertainment_stream.is_connected():
+            # Capture the lights this stream was driving before disconnecting -
+            # disconnect() only tears down the DTLS/streaming connection, it
+            # never sends an explicit "off" REST command, so the lights would
+            # otherwise freeze at their last streamed color instead of
+            # turning off.
+            light_ids = list(self.entertainment_stream.light_to_channel.keys())
             self.entertainment_stream.disconnect(self.bridge)
+
+            if turn_off_lights and light_ids:
+                timed_print(f"ModeManager: Turning off {len(light_ids)} lights")
+                for light_id in light_ids:
+                    try:
+                        self.bridge.client.set_light_state(
+                            light_id, {"on": {"on": False}}
+                        )
+                    except Exception as e:
+                        timed_print(
+                            f"ModeManager: Failed to turn off light {light_id}: {e}"
+                        )
 
         # Stop reading mode
         if self._reading_controller and self._reading_controller.is_active():

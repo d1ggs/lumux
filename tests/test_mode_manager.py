@@ -29,15 +29,33 @@ class FakeSyncController:
 
 
 class FakeEntertainmentStream:
-    def __init__(self, connected=True):
+    def __init__(self, connected=True, light_to_channel=None):
         self.entertainment_config_id = "cfg-1"
         self._connected = connected
+        self.light_to_channel = (
+            light_to_channel
+            if light_to_channel is not None
+            else {"light-1": 0, "light-2": 1}
+        )
 
     def is_connected(self):
         return self._connected
 
     def disconnect(self, bridge):
         self._connected = False
+
+
+class FakeBridgeClient:
+    def __init__(self):
+        self.calls = []
+
+    def set_light_state(self, light_id, payload):
+        self.calls.append((light_id, payload))
+
+
+class FakeBridge:
+    def __init__(self):
+        self.client = FakeBridgeClient()
 
 
 class FakeReadingController:
@@ -60,17 +78,20 @@ class FakeReadingController:
         self._active = False
 
 
-def _make_manager(monkeypatch, auto_activate=True):
+def _make_manager(monkeypatch, auto_activate=True, light_to_channel=None):
     """Build a ModeManager wired like AppContext does, with fakes standing
-    in for the sync controller, entertainment stream, and reading
+    in for the sync controller, entertainment stream, bridge, and reading
     controller, and with GLib.timeout_add captured instead of actually
     scheduled so tests can fire the pending callback manually."""
     sync_controller = FakeSyncController()
-    entertainment_stream = FakeEntertainmentStream(connected=True)
+    entertainment_stream = FakeEntertainmentStream(
+        connected=True, light_to_channel=light_to_channel
+    )
     reading_settings = ReadingModeSettings(auto_activate=auto_activate)
+    bridge = FakeBridge()
 
     manager = ModeManager(
-        bridge=object(),
+        bridge=bridge,
         sync_controller=sync_controller,
         entertainment_stream=entertainment_stream,
         reading_mode=reading_settings,
@@ -91,7 +112,14 @@ def _make_manager(monkeypatch, auto_activate=True):
     monkeypatch.setattr("lumux.mode_manager.GLib.timeout_add", fake_timeout_add)
     monkeypatch.setattr("lumux.mode_manager.HAS_GLIB", True)
 
-    return manager, sync_controller, entertainment_stream, fake_reading, scheduled
+    return (
+        manager,
+        sync_controller,
+        entertainment_stream,
+        fake_reading,
+        scheduled,
+        bridge,
+    )
 
 
 def test_turn_off_cancels_pending_reading_activation_armed_during_stop(monkeypatch):
@@ -109,7 +137,7 @@ def test_turn_off_cancels_pending_reading_activation_armed_during_stop(monkeypat
     4. turn_off() must notice and cancel this before returning
     5. when the timer callback fires later, it must be a no-op
     """
-    manager, sync_controller, entertainment_stream, fake_reading, scheduled = (
+    manager, sync_controller, entertainment_stream, fake_reading, scheduled, bridge = (
         _make_manager(monkeypatch, auto_activate=True)
     )
 
@@ -142,7 +170,7 @@ def test_switch_to_reading_still_activates_when_not_interrupted(monkeypatch):
     """Sanity check that the new guard doesn't break the normal path: a
     reading activation that is never cancelled should still complete when
     its timer fires."""
-    manager, sync_controller, entertainment_stream, fake_reading, scheduled = (
+    manager, sync_controller, entertainment_stream, fake_reading, scheduled, bridge = (
         _make_manager(monkeypatch, auto_activate=False)
     )
 
@@ -159,3 +187,52 @@ def test_switch_to_reading_still_activates_when_not_interrupted(monkeypatch):
     assert result is False  # GLib timeout convention: don't reschedule
     assert fake_reading.activate_calls == [((0.5, 0.4), 150)]
     assert manager.current_mode == Mode.READING
+
+
+def test_turn_off_sends_explicit_off_command_for_video_lights(monkeypatch):
+    """Regression test for the bug found during the live suspend test:
+    turn_off(turn_off_lights=True) in VIDEO mode must not just disconnect
+    the entertainment stream (which merely stops the DTLS/streaming
+    connection) - it must also send an explicit REST "off" command for
+    every light the stream was driving, or the lights simply freeze at
+    their last streamed color."""
+    manager, sync_controller, entertainment_stream, fake_reading, scheduled, bridge = (
+        _make_manager(
+            monkeypatch,
+            auto_activate=False,
+            light_to_channel={"light-1": 0, "light-2": 1, "light-3": 2},
+        )
+    )
+
+    manager.current_mode = Mode.VIDEO
+    assert entertainment_stream.is_connected()
+
+    result = manager.turn_off(turn_off_lights=True)
+    assert result is True
+
+    assert not entertainment_stream.is_connected()
+    assert sorted(bridge.client.calls) == sorted(
+        [
+            ("light-1", {"on": {"on": False}}),
+            ("light-2", {"on": {"on": False}}),
+            ("light-3", {"on": {"on": False}}),
+        ]
+    )
+
+
+def test_turn_off_without_turn_off_lights_sends_no_off_commands(monkeypatch):
+    """turn_off(turn_off_lights=False) must not send any explicit "off"
+    REST commands, even though the entertainment stream still gets
+    disconnected."""
+    manager, sync_controller, entertainment_stream, fake_reading, scheduled, bridge = (
+        _make_manager(monkeypatch, auto_activate=False)
+    )
+
+    manager.current_mode = Mode.VIDEO
+    assert entertainment_stream.is_connected()
+
+    result = manager.turn_off(turn_off_lights=False)
+    assert result is True
+
+    assert not entertainment_stream.is_connected()
+    assert bridge.client.calls == []
