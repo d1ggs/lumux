@@ -10,7 +10,7 @@ must be stopped before using REST API control.
 
 import time
 from enum import Enum, auto
-from typing import Optional, Tuple, Callable
+from typing import List, Optional, Tuple, Callable
 
 try:
     from gi.repository import GLib
@@ -61,6 +61,20 @@ class ModeManager:
 
         # Track pending reading mode activation to prevent duplicate calls
         self._reading_activation_pending = False
+
+        # Light ids resolved and cached the moment video sync starts, while
+        # the network is guaranteed to be up. Used by the urgent (suspend)
+        # path in turn_off() so it never has to make a get_devices() REST
+        # round-trip while NetworkManager may already be tearing interfaces
+        # down (see Task 13).
+        self._video_light_ids: List[str] = []
+
+        # Set (with try/finally) around sync_controller.stop() by the urgent
+        # turn_off() path to prevent on_video_sync_stopped() from running the
+        # synchronous switch_to_reading() auto-activate detour, which can
+        # take ~5s (openssl subprocess teardown + REST deactivate) - time we
+        # don't have before the network goes down on suspend.
+        self._suppress_auto_activate = False
 
     def set_mode_changed_callback(self, callback: Callable[[Mode], None]):
         """Set callback to be called when mode changes."""
@@ -135,6 +149,18 @@ class ModeManager:
 
         self.current_mode = Mode.VIDEO
         self._notify_mode_changed()
+
+        # Resolve and cache the light ids this stream drives now, while the
+        # network is guaranteed to be up. This removes the get_devices()
+        # REST round-trip from the suspend path entirely (see Task 13) -
+        # non-fatal on failure, turn_off() falls back to a live resolve.
+        try:
+            self._video_light_ids = self.bridge.resolve_light_ids(
+                list(self.entertainment_stream.light_to_channel.keys())
+            )
+        except Exception as e:
+            timed_print(f"ModeManager: Error resolving light ids: {e}")
+
         timed_print("ModeManager: Now in VIDEO mode")
         return True
 
@@ -251,11 +277,28 @@ class ModeManager:
             return False
         return result
 
-    def turn_off(self, turn_off_lights: bool = True) -> bool:
+    def _send_lights_off(self, light_ids: List[str]) -> None:
+        """Send an explicit REST "off" command for each light id.
+
+        Failures on individual lights are logged and otherwise ignored so
+        one unreachable light doesn't stop the rest from being turned off.
+        """
+        for light_id in light_ids:
+            try:
+                self.bridge.client.set_light_state(light_id, {"on": {"on": False}})
+            except Exception as e:
+                timed_print(f"ModeManager: Failed to turn off light {light_id}: {e}")
+
+    def turn_off(self, turn_off_lights: bool = True, urgent: bool = False) -> bool:
         """Turn off all lighting control.
 
         Args:
             turn_off_lights: If True, turn off the actual lights
+            urgent: If True, skip the synchronous auto-activate-to-reading
+                detour and get the light-off REST commands out within
+                ~1s, instead of after the normal (~5s) stream teardown.
+                Used on suspend, where NetworkManager tears the network
+                down in parallel with our handler rather than after it.
 
         Returns:
             True if successfully turned off
@@ -283,6 +326,57 @@ class ModeManager:
         if self._reading_activation_pending:
             timed_print("ModeManager: Cancelling pending reading mode activation")
             self._reading_activation_pending = False
+
+        if urgent:
+            # Suppress the synchronous auto-activate-to-reading detour:
+            # on_video_sync_stopped() would otherwise run switch_to_reading()
+            # inline, which runs the FULL entertainment_stream.disconnect()
+            # (openssl subprocess terminate + wait(timeout=2), plus a REST
+            # deactivate) before turn_off() gets a chance to send anything -
+            # ~5s we don't have before NetworkManager takes the network down.
+            try:
+                self._suppress_auto_activate = True
+                if self.sync_controller.is_running():
+                    self.sync_controller.stop()
+            finally:
+                self._suppress_auto_activate = False
+
+            # End the entertainment session immediately via a direct REST
+            # call so the bridge honors plain light commands again, without
+            # waiting for the full disconnect() teardown below.
+            if self.entertainment_stream:
+                self.bridge.deactivate_entertainment_streaming(
+                    self.entertainment_stream.entertainment_config_id
+                )
+
+            if turn_off_lights:
+                light_ids = self._video_light_ids or self.bridge.resolve_light_ids(
+                    entertainment_rids
+                )
+                if light_ids:
+                    # Send the off loop twice, 0.3s apart: the bridge needs
+                    # ~1s after deactivation before REST commands reliably
+                    # take effect, but we can't afford a full 1s wait here -
+                    # two passes 0.3s apart is the best effort within the
+                    # network window.
+                    timed_print(f"ModeManager: Turning off {len(light_ids)} lights")
+                    self._send_lights_off(light_ids)
+                    time.sleep(0.3)
+                    self._send_lights_off(light_ids)
+
+            # Normal teardown. The off-loop above already handled the
+            # light-off REST commands, so the shared end-of-teardown
+            # off-loop further below must not run again.
+            if self.entertainment_stream and self.entertainment_stream.is_connected():
+                self.entertainment_stream.disconnect(self.bridge)
+
+            if self._reading_controller and self._reading_controller.is_active():
+                self._reading_controller.deactivate(turn_off=turn_off_lights)
+
+            self.current_mode = Mode.OFF
+            self._notify_mode_changed()
+            timed_print("ModeManager: Now OFF")
+            return True
 
         # Stop video sync (this may trigger auto-activation callback)
         if self.sync_controller.is_running():
@@ -332,15 +426,7 @@ class ModeManager:
             light_ids = self.bridge.resolve_light_ids(entertainment_rids)
             if light_ids:
                 timed_print(f"ModeManager: Turning off {len(light_ids)} lights")
-                for light_id in light_ids:
-                    try:
-                        self.bridge.client.set_light_state(
-                            light_id, {"on": {"on": False}}
-                        )
-                    except Exception as e:
-                        timed_print(
-                            f"ModeManager: Failed to turn off light {light_id}: {e}"
-                        )
+                self._send_lights_off(light_ids)
 
         # Stop reading mode
         if self._reading_controller and self._reading_controller.is_active():
@@ -374,6 +460,9 @@ class ModeManager:
         Returns:
             True if auto-switched to reading mode
         """
+        if self._suppress_auto_activate:
+            return False
+
         if self.current_mode != Mode.VIDEO:
             return False
 

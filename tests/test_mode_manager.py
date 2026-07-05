@@ -29,7 +29,7 @@ class FakeSyncController:
 
 
 class FakeEntertainmentStream:
-    def __init__(self, connected=True, light_to_channel=None):
+    def __init__(self, connected=True, light_to_channel=None, events=None):
         self.entertainment_config_id = "cfg-1"
         self._connected = connected
         # Keys are fake entertainment-*service* rids (not light rids) -
@@ -41,20 +41,27 @@ class FakeEntertainmentStream:
             if light_to_channel is not None
             else {"ent-1": 0, "ent-2": 1}
         )
+        # Order-recording list, shared with FakeBridge/FakeBridgeClient when
+        # both are constructed by _make_manager, so tests can assert the
+        # relative order of deactivate/set_light_state/disconnect calls.
+        self.events = events if events is not None else []
 
     def is_connected(self):
         return self._connected
 
     def disconnect(self, bridge):
         self._connected = False
+        self.events.append(("disconnect",))
 
 
 class FakeBridgeClient:
-    def __init__(self):
+    def __init__(self, events=None):
         self.calls = []
+        self.events = events if events is not None else []
 
     def set_light_state(self, light_id, payload):
         self.calls.append((light_id, payload))
+        self.events.append(("set_light_state", light_id, payload))
 
 
 class FakeBridge:
@@ -68,15 +75,24 @@ class FakeBridge:
         "ent-3": "light-3",
     }
 
-    def __init__(self):
-        self.client = FakeBridgeClient()
+    def __init__(self, events=None):
+        self.events = events if events is not None else []
+        self.client = FakeBridgeClient(events=self.events)
+        self.resolve_light_ids_calls = 0
+        self.deactivate_calls = []
 
     def resolve_light_ids(self, entertainment_rids):
+        self.resolve_light_ids_calls += 1
         return [
             self.ENTERTAINMENT_TO_LIGHT[rid]
             for rid in entertainment_rids
             if rid in self.ENTERTAINMENT_TO_LIGHT
         ]
+
+    def deactivate_entertainment_streaming(self, config_id):
+        self.deactivate_calls.append(config_id)
+        self.events.append(("deactivate_entertainment_streaming", config_id))
+        return True
 
 
 class FakeReadingController:
@@ -105,11 +121,12 @@ def _make_manager(monkeypatch, auto_activate=True, light_to_channel=None):
     controller, and with GLib.timeout_add captured instead of actually
     scheduled so tests can fire the pending callback manually."""
     sync_controller = FakeSyncController()
+    events = []
     entertainment_stream = FakeEntertainmentStream(
-        connected=True, light_to_channel=light_to_channel
+        connected=True, light_to_channel=light_to_channel, events=events
     )
     reading_settings = ReadingModeSettings(auto_activate=auto_activate)
-    bridge = FakeBridge()
+    bridge = FakeBridge(events=events)
 
     manager = ModeManager(
         bridge=bridge,
@@ -301,3 +318,123 @@ def test_turn_off_without_turn_off_lights_sends_no_off_commands(monkeypatch):
 
     assert not entertainment_stream.is_connected()
     assert bridge.client.calls == []
+
+
+def test_turn_off_urgent_sends_lights_off_before_network_teardown(monkeypatch):
+    """Task 13 regression: live suspend testing showed NetworkManager tears
+    the network down in parallel with our suspend handler (the logind delay
+    inhibitor only delays suspend *entry*, not NetworkManager), so the
+    Task 12 code path ran but lost the race - by the time turn_off() reached
+    resolve_light_ids() ~5s later (after switch_to_reading()'s full inline
+    disconnect), the network was already gone.
+
+    urgent=True must: (1) suppress the auto-activate-to-reading detour so
+    sync_controller.stop() returns immediately instead of running that ~5s
+    inline disconnect; (2) deactivate the entertainment session directly,
+    before any set_light_state call; (3) send the off loop using the ids
+    cached by switch_to_video() (no live resolve_light_ids() round-trip);
+    (4) send that off loop twice, 0.3s apart; (5) only then run the normal
+    stream disconnect."""
+    manager, sync_controller, entertainment_stream, fake_reading, scheduled, bridge = (
+        _make_manager(
+            monkeypatch,
+            auto_activate=True,
+            light_to_channel={"ent-1": 0, "ent-2": 1},
+        )
+    )
+
+    sleeps = []
+    monkeypatch.setattr("lumux.mode_manager.time.sleep", lambda s: sleeps.append(s))
+
+    manager.current_mode = Mode.VIDEO
+    sync_controller.start()
+    # Simulate the cache switch_to_video() would have populated.
+    manager._video_light_ids = ["light-1", "light-2"]
+
+    result = manager.turn_off(turn_off_lights=True, urgent=True)
+    assert result is True
+
+    # The synchronous auto-activate detour must never have run.
+    assert fake_reading.activate_calls == []
+    assert "func" not in scheduled
+    assert manager.current_mode == Mode.OFF
+    assert manager._suppress_auto_activate is False  # reset after use
+
+    # The cache was used - zero live resolve_light_ids() round-trips.
+    assert bridge.resolve_light_ids_calls == 0
+
+    # Ordering: deactivate first, then the off loop twice, then disconnect.
+    kinds = [event[0] for event in bridge.events]
+    assert kinds == [
+        "deactivate_entertainment_streaming",
+        "set_light_state",
+        "set_light_state",
+        "set_light_state",
+        "set_light_state",
+        "disconnect",
+    ]
+    assert sleeps == [0.3]
+    assert sorted(bridge.client.calls) == sorted(
+        [
+            ("light-1", {"on": {"on": False}}),
+            ("light-2", {"on": {"on": False}}),
+        ]
+        * 2
+    )
+
+
+def test_switch_to_video_caches_resolved_light_ids(monkeypatch):
+    """Task 13: switch_to_video() must resolve and cache the light ids it
+    drives right away, while the network is guaranteed to be up. This
+    removes the get_devices() REST round-trip from the suspend path
+    entirely - the urgent turn_off() path consumes this cache instead."""
+    manager, sync_controller, entertainment_stream, fake_reading, scheduled, bridge = (
+        _make_manager(
+            monkeypatch,
+            auto_activate=False,
+            light_to_channel={"ent-1": 0, "ent-2": 1},
+        )
+    )
+
+    assert manager._video_light_ids == []
+
+    result = manager.switch_to_video()
+
+    assert result is True
+    assert manager._video_light_ids == ["light-1", "light-2"]
+
+
+def test_turn_off_non_urgent_leaves_auto_activate_and_deactivate_untouched(
+    monkeypatch,
+):
+    """Task 13: the default (non-urgent, user-initiated stop) path must be
+    byte-for-byte unaffected by the new urgent flag - auto-activate to
+    reading mode still runs (and turn_off still cancels its pending timer,
+    per the Task 11 regression test), and the new direct
+    deactivate_entertainment_streaming() short-circuit used by the urgent
+    path must never fire here."""
+    manager, sync_controller, entertainment_stream, fake_reading, scheduled, bridge = (
+        _make_manager(
+            monkeypatch,
+            auto_activate=True,
+            light_to_channel={"ent-1": 0, "ent-2": 1},
+        )
+    )
+
+    manager.current_mode = Mode.VIDEO
+    sync_controller.start()
+
+    result = manager.turn_off(turn_off_lights=True)
+    assert result is True
+
+    # Auto-activate still armed a reading-activation timer (and turn_off()
+    # cancelled it) - the pre-existing Task 11 behavior, untouched.
+    assert "func" in scheduled
+    assert manager._reading_activation_pending is False
+    assert manager._suppress_auto_activate is False
+
+    # The urgent-only direct deactivate call must not have been used.
+    assert bridge.deactivate_calls == []
+
+    # The normal path still resolves ids live (no cache populated here).
+    assert bridge.resolve_light_ids_calls == 1

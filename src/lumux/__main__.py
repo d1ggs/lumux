@@ -98,7 +98,7 @@ class LumuxApp(Adw.Application):
             "Sleep: turning lights off "
             f"(resume video after wake: {self._resume_video_after_wake})"
         )
-        self.app_context.mode_manager.turn_off(turn_off_lights=True)
+        self.app_context.mode_manager.turn_off(turn_off_lights=True, urgent=True)
 
     def _on_system_wake(self):
         """Resume video sync after wake if it was running before sleep."""
