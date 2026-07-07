@@ -16,14 +16,14 @@ from lumux.utils.logging import timed_print
 
 class HueBridge:
     """High-level interface to Philips Hue Bridge.
-    
+
     Manages connection state, device caching, and provides
     convenient methods for light/zone control.
     """
-    
+
     def __init__(self, bridge_ip: str, app_key: str):
         """Initialize bridge connection.
-        
+
         Args:
             bridge_ip: IP address of the Hue bridge
             app_key: Application key for authentication
@@ -31,7 +31,7 @@ class HueBridge:
         self.bridge_ip = bridge_ip
         self.app_key = app_key
         self._client: Optional[BridgeClient] = None
-        
+
         # Cached device info
         self.lights: Dict[str, dict] = {}
         self.zones: Dict[str, dict] = {}
@@ -48,7 +48,7 @@ class HueBridge:
         """Connect to Hue bridge using existing credentials."""
         if not self.bridge_ip or not self.app_key:
             return False
-        
+
         try:
             self.refresh_devices()
             return True
@@ -56,8 +56,13 @@ class HueBridge:
             print(f"Error connecting to bridge: {e}")
             return False
 
-    def create_user(self, bridge_ip: str, application_name: str = "lumux",
-                   max_retries: int = 3, timeout: float = 10.0) -> Optional[dict]:
+    def create_user(
+        self,
+        bridge_ip: str,
+        application_name: str = "lumux",
+        max_retries: int = 3,
+        timeout: float = 10.0,
+    ) -> Optional[dict]:
         """Create a new user/app key on the bridge.
 
         User must press the link button on the bridge before calling this.
@@ -75,7 +80,7 @@ class HueBridge:
         try:
             result = BridgeClient.create_user(bridge_ip, application_name)
             if result:
-                self.app_key = result['app_key']
+                self.app_key = result["app_key"]
                 self.bridge_ip = bridge_ip
                 self._client = None  # Reset client with new credentials
             return result
@@ -91,27 +96,30 @@ class HueBridge:
         try:
             # Fetch lights
             lights = self.client.get_lights()
-            self.lights = {light.get('id'): light for light in lights if light.get('id')}
-            
+            self.lights = {
+                light.get("id"): light for light in lights if light.get("id")
+            }
+
             # Build light info cache
             self.light_info = {}
             for light_id, light_data in self.lights.items():
-                metadata = light_data.get('metadata', {})
-                gradient_data = light_data.get('gradient', {})
-                color_data = light_data.get('color', {})
-                
+                metadata = light_data.get("metadata", {})
+                gradient_data = light_data.get("gradient", {})
+                color_data = light_data.get("color", {})
+
                 self.light_info[light_id] = {
-                    'id': light_id,
-                    'name': metadata.get('name', f'Light {light_id}'),
-                    'archetype': metadata.get('archetype', 'unknown'),
-                    'modelid': light_data.get('product_data', {}).get('model_id', ''),
-                    'type': light_data.get('type', ''),
-                    'state': light_data.get('on', {}).get('on', False),
-                    'is_gradient': 'points' in gradient_data or 'points_capable' in gradient_data,
-                    'gradient_points': gradient_data.get('points_capable', 0),
-                    'gamut_type': color_data.get('gamut_type'),
-                    'gamut': color_data.get('gamut'),
-                    'position': None  # Filled from entertainment config
+                    "id": light_id,
+                    "name": metadata.get("name", f"Light {light_id}"),
+                    "archetype": metadata.get("archetype", "unknown"),
+                    "modelid": light_data.get("product_data", {}).get("model_id", ""),
+                    "type": light_data.get("type", ""),
+                    "state": light_data.get("on", {}).get("on", False),
+                    "is_gradient": "points" in gradient_data
+                    or "points_capable" in gradient_data,
+                    "gradient_points": gradient_data.get("points_capable", 0),
+                    "gamut_type": color_data.get("gamut_type"),
+                    "gamut": color_data.get("gamut"),
+                    "position": None,  # Filled from entertainment config
                 }
 
             # Fetch spatial data from entertainment configurations
@@ -119,7 +127,7 @@ class HueBridge:
 
             # Fetch zones
             zones = self.client.get_zones()
-            self.zones = {zone.get('id'): zone for zone in zones if zone.get('id')}
+            self.zones = {zone.get("id"): zone for zone in zones if zone.get("id")}
 
         except BridgeError as e:
             print(f"Error refreshing devices: {e}")
@@ -132,48 +140,90 @@ class HueBridge:
         try:
             # 1. Get devices to map light service IDs to entertainment service IDs
             devices = self.client.get_devices()
-            
+
             service_map: Dict[str, str] = {}  # light_rid -> entertainment_rid
             for device in devices:
-                services = device.get('services', [])
-                light_rids = [s['rid'] for s in services if s.get('rtype') == 'light']
-                ent_rids = [s['rid'] for s in services if s.get('rtype') == 'entertainment']
+                services = device.get("services", [])
+                light_rids = [s["rid"] for s in services if s.get("rtype") == "light"]
+                ent_rids = [
+                    s["rid"] for s in services if s.get("rtype") == "entertainment"
+                ]
                 if light_rids and ent_rids:
                     for light_rid in light_rids:
                         service_map[light_rid] = ent_rids[0]
 
             # 2. Get entertainment configurations
             ent_configs = self.client.get_entertainment_configurations()
-            
+
             found_count = 0
             for config in ent_configs:
-                locations = config.get('locations', {}).get('service_locations', [])
+                locations = config.get("locations", {}).get("service_locations", [])
                 for location in locations:
-                    ent_rid = location.get('service', {}).get('rid')
-                    position = location.get('position')
+                    ent_rid = location.get("service", {}).get("rid")
+                    position = location.get("position")
                     if not ent_rid or not position:
                         continue
-                    
+
                     # Find light_id for this entertainment_rid
                     for light_rid, mapped_ent_rid in service_map.items():
                         if mapped_ent_rid == ent_rid and light_rid in self.light_info:
-                            self.light_info[light_rid]['position'] = position
+                            self.light_info[light_rid]["position"] = position
                             found_count += 1
-            
+
             if found_count > 0:
-                print(f"Spatial data refreshed: Found positions for {found_count} lights.")
+                print(
+                    f"Spatial data refreshed: Found positions for {found_count} lights."
+                )
             else:
-                print("Spatial data refreshed: No light positions found in entertainment zones.")
-            
+                print(
+                    "Spatial data refreshed: No light positions found in entertainment zones."
+                )
+
         except BridgeError as e:
             print(f"Error refreshing spatial data: {e}")
 
+    def resolve_light_ids(
+        self, entertainment_rids: List[str], timeout: Optional[float] = None
+    ) -> List[str]:
+        """Resolve entertainment-service resource IDs to light resource IDs.
+
+        `entertainment_stream.light_to_channel` (and the entertainment
+        configuration's channel members) key on `rtype: "entertainment"`
+        service resource IDs, not `rtype: "light"` IDs. `set_light_state()`
+        needs the latter. Mirrors the `service_map` construction in
+        `_refresh_spatial_data()`: each device's `services` list contains
+        both a `light` and an `entertainment` service sharing that device.
+
+        Args:
+            entertainment_rids: Entertainment-service resource IDs to resolve.
+
+        Returns:
+            List of light resource IDs for devices whose entertainment
+            service rid is in `entertainment_rids`. Empty list on failure.
+        """
+        if not self.client:
+            return []
+
+        try:
+            devices = self.client.get_devices(timeout=timeout)
+
+            light_ids: List[str] = []
+            for device in devices:
+                services = device.get("services", [])
+                light_rids = [s["rid"] for s in services if s.get("rtype") == "light"]
+                ent_rids = [
+                    s["rid"] for s in services if s.get("rtype") == "entertainment"
+                ]
+                if light_rids and ent_rids and ent_rids[0] in entertainment_rids:
+                    light_ids.extend(light_rids)
+
+            return light_ids
+        except BridgeError as e:
+            print(f"Error resolving light ids: {e}")
+            return []
+
     def set_light_color(
-        self, 
-        light_id: str, 
-        xy: tuple, 
-        brightness: int,
-        transition_time: int = 100
+        self, light_id: str, xy: tuple, brightness: int, transition_time: int = 100
     ):
         """Set individual light color and brightness.
 
@@ -185,24 +235,26 @@ class HueBridge:
         """
         if not self.client:
             return
-        
+
         # Validate inputs
         if not light_id or not isinstance(xy, (tuple, list)) or len(xy) != 2:
             print(f"Invalid light color parameters: light_id={light_id}, xy={xy}")
             return
-        
+
         try:
             if self.client.set_light_color(light_id, xy, brightness, transition_time):
-                timed_print(f"Set light {light_id} color to xy={xy}, brightness={brightness}")
+                timed_print(
+                    f"Set light {light_id} color to xy={xy}, brightness={brightness}"
+                )
         except BridgeError as e:
             print(f"Error setting light color: {e}")
 
     def set_light_gradient(
-        self, 
-        light_id: str, 
-        fixed_points: List[Dict], 
+        self,
+        light_id: str,
+        fixed_points: List[Dict],
         brightness: int,
-        transition_time: Optional[int] = None
+        transition_time: Optional[int] = None,
     ):
         """Set gradient light colors.
 
@@ -216,17 +268,17 @@ class HueBridge:
             return
 
         try:
-            if self.client.set_light_gradient(light_id, fixed_points, brightness, transition_time):
-                timed_print(f"Set light {light_id} gradient with {len(fixed_points)} points, brightness={brightness}")
+            if self.client.set_light_gradient(
+                light_id, fixed_points, brightness, transition_time
+            ):
+                timed_print(
+                    f"Set light {light_id} gradient with {len(fixed_points)} points, brightness={brightness}"
+                )
         except BridgeError as e:
             print(f"Error setting light gradient: {e}")
 
     def set_zone_color(
-        self, 
-        zone_id: str, 
-        xy: tuple, 
-        brightness: int,
-        transition_time: int = 100
+        self, zone_id: str, xy: tuple, brightness: int, transition_time: int = 100
     ):
         """Set entire zone color and brightness.
 
@@ -251,12 +303,12 @@ class HueBridge:
     def get_light_name(self, light_id: str) -> str:
         """Get light name from ID."""
         info = self.light_info.get(light_id)
-        return info.get('name', f"Light {light_id}") if info else f"Light {light_id}"
+        return info.get("name", f"Light {light_id}") if info else f"Light {light_id}"
 
     def get_light_names(self) -> Dict[str, str]:
         """Get mapping of light IDs to names."""
         return {
-            light_id: info.get('name', f"Light {light_id}")
+            light_id: info.get("name", f"Light {light_id}")
             for light_id, info in self.light_info.items()
         }
 
@@ -267,7 +319,7 @@ class HueBridge:
         max_retries: int = 1,
         use_ssdp: bool = True,
         use_mdns: bool = True,
-        use_nupnp: bool = True
+        use_nupnp: bool = True,
     ) -> List[str]:
         """Discover Hue bridges on local network using multiple methods.
 
@@ -352,7 +404,7 @@ class HueBridge:
             ssdp_request = (
                 b"M-SEARCH * HTTP/1.1\r\n"
                 b"HOST: 239.255.255.250:1900\r\n"
-                b"MAN: \"ssdp:discover\"\r\n"
+                b'MAN: "ssdp:discover"\r\n'
                 b"MX: 3\r\n"
                 b"ST: ssdp:all\r\n"
                 b"\r\n"
@@ -365,9 +417,12 @@ class HueBridge:
             while time.time() - start_time < timeout:
                 try:
                     data, addr = sock.recvfrom(1024)
-                    response = data.decode('utf-8', errors='ignore')
+                    response = data.decode("utf-8", errors="ignore")
 
-                    if "hue-bridgeid" in response.lower() or "phillips-hue" in response.lower():
+                    if (
+                        "hue-bridgeid" in response.lower()
+                        or "phillips-hue" in response.lower()
+                    ):
                         ip_address = addr[0]
                         if ip_address not in bridges:
                             bridges.append(ip_address)
@@ -447,16 +502,13 @@ class HueBridge:
 
         try:
             url = "https://discovery.meethue.com/"
-            req = urllib.request.Request(
-                url,
-                headers={"User-Agent": "Lumux/1.0"}
-            )
+            req = urllib.request.Request(url, headers={"User-Agent": "Lumux/1.0"})
 
             with urllib.request.urlopen(req, timeout=5) as response:
-                data = json.loads(response.read().decode('utf-8'))
+                data = json.loads(response.read().decode("utf-8"))
 
                 for bridge in data:
-                    internal_ip = bridge.get('internalipaddress')
+                    internal_ip = bridge.get("internalipaddress")
                     if internal_ip and internal_ip not in bridges:
                         bridges.append(internal_ip)
                         print(f"N-UPnP found bridge at {internal_ip}")
@@ -480,17 +532,17 @@ class HueBridge:
         """Fetch all entertainment configurations from the bridge."""
         if not self.client:
             return []
-        
+
         try:
             configs = self.client.get_entertainment_configurations()
             return [
                 {
-                    'id': config.get('id'),
-                    'name': config.get('metadata', {}).get('name', 'Unknown'),
-                    'status': config.get('status'),
-                    'configuration_type': config.get('configuration_type'),
-                    'channels': config.get('channels', []),
-                    'locations': config.get('locations', {})
+                    "id": config.get("id"),
+                    "name": config.get("metadata", {}).get("name", "Unknown"),
+                    "status": config.get("status"),
+                    "configuration_type": config.get("configuration_type"),
+                    "channels": config.get("channels", []),
+                    "locations": config.get("locations", {}),
                 }
                 for config in configs
             ]
@@ -502,17 +554,17 @@ class HueBridge:
         """Fetch a specific entertainment configuration by ID."""
         if not self.client:
             return None
-        
+
         try:
             config = self.client.get_entertainment_configuration(config_id)
             if config:
                 return {
-                    'id': config.get('id'),
-                    'name': config.get('metadata', {}).get('name', 'Unknown'),
-                    'status': config.get('status'),
-                    'configuration_type': config.get('configuration_type'),
-                    'channels': config.get('channels', []),
-                    'locations': config.get('locations', {})
+                    "id": config.get("id"),
+                    "name": config.get("metadata", {}).get("name", "Unknown"),
+                    "status": config.get("status"),
+                    "configuration_type": config.get("configuration_type"),
+                    "channels": config.get("channels", []),
+                    "locations": config.get("locations", {}),
                 }
         except BridgeError as e:
             print(f"Error fetching entertainment configuration: {e}")
@@ -522,7 +574,7 @@ class HueBridge:
         """Activate entertainment streaming for a configuration."""
         if not self.client:
             return False
-        
+
         try:
             if self.client.activate_entertainment_streaming(config_id):
                 timed_print(f"Entertainment streaming activated for config {config_id}")
@@ -532,20 +584,29 @@ class HueBridge:
             print(f"Failed to activate streaming: {e}")
             return False
 
-    def deactivate_entertainment_streaming(self, config_id: str) -> bool:
+    def deactivate_entertainment_streaming(
+        self, config_id: str, timeout: Optional[float] = None
+    ) -> bool:
         """Deactivate entertainment streaming for a configuration."""
         if not self.client:
             return False
-        
+
         try:
-            if self.client.deactivate_entertainment_streaming(config_id):
-                timed_print(f"Entertainment streaming deactivated for config {config_id}")
+            if self.client.deactivate_entertainment_streaming(
+                config_id, timeout=timeout
+            ):
+                timed_print(
+                    f"Entertainment streaming deactivated for config {config_id}"
+                )
                 return True
+            timed_print(
+                f"Entertainment streaming deactivate returned False for config {config_id}"
+            )
             return False
         except BridgeError as e:
             print(f"Failed to deactivate streaming: {e}")
             return False
-    
+
     def get_application_id(self) -> Optional[str]:
         """Get hue-application-id for DTLS PSK identity."""
         if not self.client:

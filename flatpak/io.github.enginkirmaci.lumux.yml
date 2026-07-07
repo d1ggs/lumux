@@ -22,6 +22,9 @@ finish-args:
   - --talk-name=org.freedesktop.StatusNotifierWatcher
   - --talk-name=org.freedesktop.Notifications
 
+  # Lights off on suspend / resume sync on wake (logind PrepareForSleep + inhibitor)
+  - --system-talk-name=org.freedesktop.login1
+
 cleanup:
   - /include
   - /lib/pkgconfig

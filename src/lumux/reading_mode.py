@@ -102,27 +102,30 @@ class ReadingModeController:
             timed_print("Reading mode: Failed to activate")
             return False
     
-    def deactivate(self, turn_off: bool = False) -> bool:
+    def deactivate(self, turn_off: bool = False, timeout: Optional[float] = None) -> bool:
         """Deactivate reading mode.
-        
+
         Args:
             turn_off: If True, turn lights off. If False, leave at current state.
-            
+            timeout: Optional per-request timeout for the off commands
+                (used by the urgent suspend path, where the default 5s
+                could outlive the network).
+
         Returns:
             True if operation succeeded
         """
         if not self._state.is_active:
             return True
-        
+
         if turn_off:
             light_ids = self._get_target_light_ids()
             timed_print(f"Reading mode: Turning off {len(light_ids)} lights")
-            
+
             for light_id in light_ids:
                 try:
                     # Turn light off via bridge client
                     if self.bridge.client:
-                        self.bridge.client.set_light_state(light_id, {'on': {'on': False}})
+                        self.bridge.client.set_light_state(light_id, {'on': {'on': False}}, timeout=timeout)
                 except Exception as e:
                     timed_print(f"Reading mode: Failed to turn off light {light_id}: {e}")
         

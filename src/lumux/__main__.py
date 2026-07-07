@@ -10,12 +10,17 @@ from gi.repository import Gtk, Adw, Gio, GLib, Gdk
 from lumux.config.settings_manager import SettingsManager
 from lumux.gui.main_window import MainWindow
 from lumux.app_context import AppContext
+from lumux.mode_manager import Mode
+from lumux.sleep_monitor import SleepMonitor
 from lumux.utils.logging import timed_print
 
 # Get the app icon path (relative to this file's location in src/lumux/)
 # Icon is at project_root/io.github.enginkirmaci.lumux.svg
 APP_ICON_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "..", "io.github.enginkirmaci.lumux.svg"
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "..",
+    "io.github.enginkirmaci.lumux.svg",
 )
 APP_ICON_PATH = os.path.normpath(APP_ICON_PATH)
 
@@ -34,6 +39,11 @@ class LumuxApp(Adw.Application):
         # Ensures Hue lights are turned off when system sends SIGTERM/SIGINT
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
+
+        # Suspend/resume handling (lights off on sleep, resume sync on wake)
+        self._sleep_monitor = None
+        self._resume_video_after_wake = False
+        self._wake_resume_attempts = 0
 
     def _handle_signal(self, signum, frame):
         """Handle SIGTERM/SIGINT by triggering clean shutdown."""
@@ -79,6 +89,47 @@ class LumuxApp(Adw.Application):
             self.main_window._quitting = True
         self.quit()
         return False  # Don't repeat
+
+    def _on_system_sleep(self):
+        """Turn lighting off before the system suspends."""
+        if not getattr(self, "app_context", None):
+            return
+        # Only touch lights Lumux is actually managing. If the mode is OFF,
+        # any light that happens to be on was set by the user through other
+        # means (Hue app, switches) and is not ours to turn off.
+        if self.app_context.mode_manager.get_current_mode() == Mode.OFF:
+            timed_print("Sleep: no active mode, leaving lights alone")
+            self._resume_video_after_wake = False
+            return
+        self._resume_video_after_wake = self.app_context.mode_manager.is_video_active()
+        timed_print(
+            "Sleep: turning lights off "
+            f"(resume video after wake: {self._resume_video_after_wake})"
+        )
+        self.app_context.mode_manager.turn_off(turn_off_lights=True, urgent=True)
+
+    def _on_system_wake(self):
+        """Resume video sync after wake if it was running before sleep."""
+        if not self._resume_video_after_wake:
+            return
+        self._resume_video_after_wake = False
+        self._wake_resume_attempts = 0
+        GLib.timeout_add_seconds(2, self._try_resume_video_sync)
+
+    def _try_resume_video_sync(self):
+        """GLib timeout callback: retry switch_to_video until the bridge is back."""
+        if not getattr(self, "app_context", None):
+            return False
+        if self.app_context.mode_manager.is_video_active():
+            return False
+        self._wake_resume_attempts += 1
+        if self.app_context.mode_manager.switch_to_video():
+            timed_print("Wake: video sync resumed")
+            return False
+        if self._wake_resume_attempts >= 10:
+            timed_print("Wake: giving up on resuming video sync after 10 attempts")
+            return False
+        return True
 
     def _auto_activate_reading_mode(self):
         """Auto-activate reading mode after startup delay.
@@ -146,6 +197,11 @@ class LumuxApp(Adw.Application):
         self.app_context = AppContext(settings)
         bridge_status = self.app_context.start()
 
+        self._sleep_monitor = SleepMonitor(
+            on_sleep=self._on_system_sleep, on_wake=self._on_system_wake
+        )
+        self._sleep_monitor.start()
+
         if bridge_status.connected:
             timed_print(f"Connected to Hue bridge at {bridge_status.bridge_ip}")
         else:
@@ -187,6 +243,8 @@ class LumuxApp(Adw.Application):
     def do_shutdown(self):
         """Cleanup on shutdown."""
         timed_print("Shutting down...")
+        if getattr(self, "_sleep_monitor", None):
+            self._sleep_monitor.stop()
         if getattr(self, "app_context", None):
             self.app_context.shutdown()
         Adw.Application.do_shutdown(self)
