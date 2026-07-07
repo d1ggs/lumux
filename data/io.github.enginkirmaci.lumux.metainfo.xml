@@ -77,6 +77,18 @@
   </branding>
 
   <releases>
+    <release version="0.6.3" date="2026-07-07">
+      <description>
+        <p>Suspend/resume support:</p>
+        <ul>
+          <li>Lights turn off when the system suspends (black frames streamed over the entertainment session before the network goes down)</li>
+          <li>Video sync resumes automatically and silently after wake</li>
+          <li>Screen-share permission persists across restarts via the portal restore token (no more picker dialog at every launch)</li>
+          <li>Explicit light-off commands when stopping video sync</li>
+          <li>Hardened settings saves (atomic, thread-safe) and louder bridge error reporting</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-04-23">
       <description>
         <p>Performance and refactoring:</p>
