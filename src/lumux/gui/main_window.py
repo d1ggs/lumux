@@ -16,7 +16,8 @@ from lumux.gui.tray_icon import TrayIcon
 # App icon path — icon is in flatpak/ directory at project root
 APP_ICON_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
-    "flatpak", "io.github.enginkirmaci.lumux.svg",
+    "flatpak",
+    "io.github.enginkirmaci.lumux.svg",
 )
 
 
@@ -577,6 +578,13 @@ class MainWindow(Adw.ApplicationWindow):
             self.status_label.set_text("Video Mode")
             self.status_subtitle.set_text("Syncing screen colors to lights")
             self._update_status_card("syncing")
+            # Mirror the READING/OFF branches below: this callback is the
+            # single source of truth for the sync button, so any path that
+            # enters VIDEO mode (click, tray, wake auto-resume, ...) leaves
+            # the button consistent with the header, not just the click
+            # handler that historically set this directly.
+            self._update_sync_button_state(True)
+            self.sync_button.set_sensitive(True)
             self._switch_to_video_mode()
         elif mode == Mode.READING:
             self.reading_mode_btn.set_active(True)
