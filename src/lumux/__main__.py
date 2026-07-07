@@ -10,6 +10,7 @@ from gi.repository import Gtk, Adw, Gio, GLib, Gdk
 from lumux.config.settings_manager import SettingsManager
 from lumux.gui.main_window import MainWindow
 from lumux.app_context import AppContext
+from lumux.mode_manager import Mode
 from lumux.sleep_monitor import SleepMonitor
 from lumux.utils.logging import timed_print
 
@@ -92,6 +93,13 @@ class LumuxApp(Adw.Application):
     def _on_system_sleep(self):
         """Turn lighting off before the system suspends."""
         if not getattr(self, "app_context", None):
+            return
+        # Only touch lights Lumux is actually managing. If the mode is OFF,
+        # any light that happens to be on was set by the user through other
+        # means (Hue app, switches) and is not ours to turn off.
+        if self.app_context.mode_manager.get_current_mode() == Mode.OFF:
+            timed_print("Sleep: no active mode, leaving lights alone")
+            self._resume_video_after_wake = False
             return
         self._resume_video_after_wake = self.app_context.mode_manager.is_video_active()
         timed_print(

@@ -310,9 +310,12 @@ class ModeManager:
 
         Args:
             turn_off_lights: If True, turn off the actual lights
-            urgent: If True, skip the synchronous auto-activate-to-reading
-                detour and get the light-off REST commands out within
-                ~1s, instead of after the normal (~5s) stream teardown.
+            urgent: If True, immediately stream black frames over the
+                open DTLS socket (the only channel that beats the network
+                teardown on suspend - the lamp holds its last streamed
+                color when the session later dies, so black = dark), then
+                run the REST teardown best-effort with short timeouts,
+                skipping the synchronous auto-activate-to-reading detour.
                 Used on suspend, where NetworkManager tears the network
                 down in parallel with our handler rather than after it.
 
@@ -436,7 +439,7 @@ class ModeManager:
                 self.entertainment_stream.disconnect(self.bridge)
 
             if self._reading_controller and self._reading_controller.is_active():
-                self._reading_controller.deactivate(turn_off=turn_off_lights)
+                self._reading_controller.deactivate(turn_off=turn_off_lights, timeout=2)
 
             self.current_mode = Mode.OFF
             self._notify_mode_changed()
