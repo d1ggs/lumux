@@ -344,11 +344,15 @@ def test_turn_off_urgent_sends_lights_off_before_network_teardown(monkeypatch):
     timeout meant the off commands went out long after the network window
     closed, with no error logged to explain why.
 
-    urgent=True must now, in order: (1) suppress the auto-activate-to-reading
-    detour and pause the DTLS sender (sync_controller.pause_sending(), NOT
-    sync_controller.stop() - that expensive join/portal-close teardown is
-    deferred to the very end); (2) stream 3 black frames over the
-    already-open DTLS socket - immune to the REST/network race entirely;
+    urgent=True must now, in order: (1) stream 3 black frames over the
+    already-open DTLS socket FIRST, before anything else - immune to the
+    REST/network race entirely, and the only channel fast enough to win it
+    (Task 15: live test #5 showed NetworkManager can down the interface
+    within ~100-150ms, faster than any REST call and faster than the old
+    0.1s drain sleep this used to wait on); (2) suppress the
+    auto-activate-to-reading detour and pause the DTLS sender
+    (sync_controller.pause_sending(), NOT sync_controller.stop() - that
+    expensive join/portal-close teardown is deferred to the very end);
     (3) deactivate the entertainment session directly, with a short
     timeout=2; (4) send the off loop (cached ids, no live
     resolve_light_ids() round-trip) twice, 0.3s apart, also with
@@ -382,14 +386,14 @@ def test_turn_off_urgent_sends_lights_off_before_network_teardown(monkeypatch):
     # The cache was used - zero live resolve_light_ids() round-trips.
     assert bridge.resolve_light_ids_calls == 0
 
-    # Ordering: pause_sending, then 3 blackout frames, then deactivate,
-    # then the off loop twice, then disconnect.
+    # Ordering: 3 blackout frames FIRST, then pause_sending, then
+    # deactivate, then the off loop twice, then disconnect.
     kinds = [event[0] for event in bridge.events]
     assert kinds == [
+        "blackout",
+        "blackout",
+        "blackout",
         "pause_sending",
-        "blackout",
-        "blackout",
-        "blackout",
         "deactivate_entertainment_streaming",
         "set_light_state",
         "set_light_state",
@@ -397,7 +401,7 @@ def test_turn_off_urgent_sends_lights_off_before_network_teardown(monkeypatch):
         "set_light_state",
         "disconnect",
     ]
-    assert sleeps == [0.1, 0.05, 0.05, 0.05, 0.3]
+    assert sleeps == [0.02, 0.02, 0.3]
     assert sorted(bridge.client.calls) == sorted(
         [
             ("light-1", {"on": {"on": False}}),

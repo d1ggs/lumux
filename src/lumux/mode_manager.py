@@ -344,49 +344,55 @@ class ModeManager:
             self._reading_activation_pending = False
 
         if urgent:
+            # Fifth live test (fully instrumented) plus three controlled
+            # bridge experiments settled the physics: NetworkManager reacts
+            # to the same PrepareForSleep signal we do and can down the
+            # interface within ~100-150ms - faster than ANY REST call, and
+            # faster than the 0.1s drain sleep this used to wait on before
+            # sending the first blackout frame. No REST call and no T+150ms
+            # UDP frame can win that race. The ONLY channel that can win is
+            # the DTLS blackout, and it has to go out at ~T+0, not T+150ms:
+            # if the last streamed frames are black, the bridge's session
+            # timeout during sleep resolves to "on at black" = visually
+            # dark, with zero packets needed after the first ~50ms. The
+            # blackout latch (set under the stream lock, added after the
+            # Task 14 review) makes any pause/drain ordering irrelevant -
+            # an in-flight sync frame either lands before blackout #1 or is
+            # dropped by the latch - so the blackout loop goes out before
+            # pause_sending(), before the suppress-flag dance, before ANY
+            # other statement in this branch.
+            if self.entertainment_stream:
+                for i in range(3):
+                    timed_print(f"ModeManager: [urgent] blackout {i + 1}/3")
+                    self.entertainment_stream.blackout()
+                    if i < 2:
+                        time.sleep(0.02)
+
             # Suppress the synchronous auto-activate-to-reading detour:
             # on_video_sync_stopped() would otherwise run switch_to_reading()
             # inline, which runs the FULL entertainment_stream.disconnect()
             # (openssl subprocess terminate + wait(timeout=2), plus a REST
             # deactivate) before turn_off() gets a chance to send anything -
             # ~5s we don't have before NetworkManager takes the network down.
-            #
-            # Fourth live test: even with the Task 13 reordering, the lamp
-            # stayed ON - every REST failure in this chain is silent
-            # (`except BridgeError: return False`, no log), and the ~5s
-            # sync_controller.stop() (thread join + portal Close() D-Bus
-            # call) plus the deactivate PUT's 5s default timeout meant the
-            # off commands went out long after the network window closed.
-            # New order: pause the DTLS sender and stream black frames
-            # FIRST (immune to the network race - the lamp freezes at its
-            # last streamed color, so black = visually off), defer the
-            # expensive sync_controller.stop() teardown to the end, and
-            # give every REST call a short timeout with a logged result.
+            # Everything below is free hardening for slower network
+            # teardowns (ethernet vs wifi, other distros) - it no longer has
+            # to win the race by itself, the blackout above already has.
             try:
                 self._suppress_auto_activate = True
 
-                # Step 1: stop new color frames going out over the DTLS
-                # stream immediately. Unlike sync_controller.stop() (moved
-                # to the heavy teardown below), pause_sending() doesn't
-                # join the thread or close the capture pipeline - it takes
-                # effect within one frame period (~33ms).
+                # Stop new color frames going out over the DTLS stream.
+                # Unlike sync_controller.stop() (moved to the heavy teardown
+                # below), pause_sending() doesn't join the thread or close
+                # the capture pipeline - it takes effect within one frame
+                # period (~33ms). The blackout above already latched black
+                # as the last frame; this just guards against a stray sync
+                # frame racing back in before the heavy teardown below.
                 timed_print("ModeManager: [urgent] pausing sync sender")
                 self.sync_controller.pause_sending()
-                time.sleep(0.1)  # let the in-flight frame drain
 
-                # Step 2: stream black frames over the already-open DTLS
-                # socket - the one channel immune to every REST/network
-                # race below. 3x with a short gap for margin against a
-                # dropped frame; lamp should be visually dark by ~T+0.4s.
-                if self.entertainment_stream:
-                    for i in range(3):
-                        timed_print(f"ModeManager: [urgent] blackout {i + 1}/3")
-                        self.entertainment_stream.blackout()
-                        time.sleep(0.05)
-
-                # Step 3: end the entertainment session immediately via a
-                # direct REST call (short timeout) so the bridge honors
-                # plain light commands again, without waiting for the full
+                # End the entertainment session immediately via a direct
+                # REST call (short timeout) so the bridge honors plain
+                # light commands again, without waiting for the full
                 # disconnect() teardown below.
                 if self.entertainment_stream:
                     deactivated = self.bridge.deactivate_entertainment_streaming(
@@ -397,7 +403,7 @@ class ModeManager:
                         f"ModeManager: [urgent] deactivate_entertainment_streaming -> {deactivated}"
                     )
 
-                # Step 4: off loop (cached ids) double-pass, 0.3s apart.
+                # Off loop (cached ids) double-pass, 0.3s apart.
                 if turn_off_lights and (self._video_light_ids or entertainment_rids):
                     light_ids = self._video_light_ids or self.bridge.resolve_light_ids(
                         entertainment_rids, timeout=2
@@ -415,7 +421,7 @@ class ModeManager:
                         time.sleep(0.3)
                         self._send_lights_off(light_ids, timeout=2)
 
-                # Step 5: heavy teardown, exactly as before - thread join /
+                # Heavy teardown, exactly as before - thread join /
                 # capture pipeline stop / portal Close(). The stop callback
                 # is still suppressed.
                 if self.sync_controller.is_running():
