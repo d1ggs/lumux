@@ -77,6 +77,17 @@
   </branding>
 
   <releases>
+    <release version="0.6.4" date="2026-07-27">
+      <description>
+        <p>Survive compositor screencast interruptions:</p>
+        <ul>
+          <li>Recover automatically when the compositor closes the screen-cast session (screen lock/unlock, monitor mode change) instead of crashing silently</li>
+          <li>Keep the entertainment session alive while capture is stalled so the bridge does not time it out</li>
+          <li>Tray icon exits when the main app dies instead of lingering as a zombie</li>
+          <li>Log output is flushed and unbuffered so crashes are diagnosable from the journal</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.3" date="2026-07-07">
       <description>
         <p>Suspend/resume support:</p>

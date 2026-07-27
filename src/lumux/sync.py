@@ -50,6 +50,14 @@ class SyncController:
         # Zone to channel mapping for entertainment streaming
         self._zone_channel_map: Dict[str, int] = {}
 
+        # Last frame actually sent over the DTLS stream, repeated as a
+        # keepalive when capture stalls (e.g. the compositor closed the
+        # portal session): the bridge kills an entertainment session after
+        # ~10s of silence, and is_connected() cannot see that death.
+        self._last_channel_colors: Optional[Dict] = None
+        self._last_send_time = 0.0
+        self._keepalive_interval = 5.0
+
         self._stats = {
             "fps": 0,
             "frame_count": 0,
@@ -280,6 +288,7 @@ class SyncController:
         screen = self.capture.capture()
         t_capture = time.time() - t_capture
         if screen is None:
+            self._maybe_send_keepalive()
             return
 
         t_zones = time.time()
@@ -358,6 +367,28 @@ class SyncController:
         # Send to all channels via DTLS, unless pause_sending() was called
         if channel_colors and not self._send_paused:
             self.entertainment_stream.send_colors_xy(channel_colors)
+            self._last_channel_colors = channel_colors
+            self._last_send_time = time.monotonic()
+
+    def _maybe_send_keepalive(self):
+        """Repeat the last sent frame if nothing has gone out recently.
+
+        Called when a frame produced nothing to send (capture stalled).
+        Not sending for ~10s makes the bridge silently kill the
+        entertainment session, which the client cannot detect - so keep it
+        alive until capture recovers.
+        """
+        if self._send_paused or self._last_channel_colors is None:
+            return
+        if time.monotonic() - self._last_send_time < self._keepalive_interval:
+            return
+        if (
+            not self.entertainment_stream
+            or not self.entertainment_stream.is_connected()
+        ):
+            return
+        self.entertainment_stream.send_colors_xy(self._last_channel_colors)
+        self._last_send_time = time.monotonic()
 
     def _queue_status(self, status_type: str, message, data=None):
         """Queue status update for GUI thread."""

@@ -8,16 +8,22 @@ from lumux.capture import ScreenCapture
 class FakeConnection:
     def __init__(self):
         self.subscriptions = {}
+        self._sub_ids = {}
+        self.unsubscribed = []
         self._next_id = 1
 
     def signal_subscribe(self, sender, iface, signal, path, arg0, flags, callback):
         self.subscriptions[path] = callback
         sub_id = self._next_id
         self._next_id += 1
+        self._sub_ids[sub_id] = path
         return sub_id
 
     def signal_unsubscribe(self, sub_id):
-        pass
+        self.unsubscribed.append(sub_id)
+        path = self._sub_ids.pop(sub_id, None)
+        if path is not None and self.subscriptions.get(path) is not None:
+            self.subscriptions.pop(path, None)
 
 
 class FakeScreenCast:
@@ -32,6 +38,7 @@ class FakeScreenCast:
         self._responses = responses
         self._request_counter = 0
         self.select_sources_calls = []
+        self.create_session_calls = []
 
     def _fire_response(self, method_name):
         self._request_counter += 1
@@ -55,6 +62,7 @@ class FakeScreenCast:
         return path
 
     def CreateSession(self, options):
+        self.create_session_calls.append(options)
         return self._fire_response("CreateSession")
 
     def SelectSources(self, session_handle, options):
@@ -224,6 +232,87 @@ def test_first_ever_token_fires_callback():
 
     assert saved_tokens == ["FIRST"]
     assert capture._restore_token == "FIRST"
+
+
+def _fire_session_closed(bus, session_handle="/session/1"):
+    """Deliver the portal's Session.Closed signal like the compositor would."""
+    callback = bus.con.subscriptions[session_handle]
+    callback(
+        None,
+        ":1.99",
+        session_handle,
+        "org.freedesktop.portal.Session",
+        "Closed",
+        (),
+    )
+
+
+def test_session_closed_signal_resets_portal_state():
+    screencast = FakeScreenCast(None, _responses(start_results={"streams": [(42, {})]}))
+    bus = FakeBus(screencast)
+
+    with patch("pydbus.SessionBus", return_value=bus):
+        capture = ScreenCapture(source_type="screen")
+        assert capture._setup_portal_session() is True
+        _fire_session_closed(bus)
+
+    assert capture._portal_node_id is None
+    assert capture._portal_session_handle is None
+    assert capture._pipeline_running is False
+
+
+def test_capture_reestablishes_session_after_session_closed():
+    screencast = FakeScreenCast(
+        None,
+        _responses(start_results={"streams": [(42, {})], "restore_token": "TOK"}),
+    )
+    bus = FakeBus(screencast)
+
+    with patch("pydbus.SessionBus", return_value=bus):
+        capture = ScreenCapture(source_type="screen")
+        with patch.object(capture, "_start_pipeline", return_value=False):
+            assert capture.capture() is None  # first portal setup
+            _fire_session_closed(bus)
+            assert capture.capture() is None  # must re-run the portal setup
+
+    assert len(screencast.create_session_calls) == 2
+    # The recovery attempt reuses the restore token from the first grant
+    assert screencast.select_sources_calls[1]["restore_token"].unpack() == "TOK"
+
+
+def test_failed_portal_setup_is_rate_limited():
+    class CountingFailScreenCast(FakeScreenCast):
+        def CreateSession(self, options):
+            self.create_session_calls.append(options)
+            raise Exception("portal unavailable")
+
+    screencast = CountingFailScreenCast(None, _responses(start_results={}))
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture = ScreenCapture(source_type="screen")
+        assert capture.capture() is None
+        assert capture.capture() is None  # inside backoff window: no new attempt
+
+    assert len(screencast.create_session_calls) == 1
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture._next_portal_retry = 0.0  # backoff elapsed
+        assert capture.capture() is None
+
+    assert len(screencast.create_session_calls) == 2
+
+
+def test_stop_pipeline_unsubscribes_session_closed_signal():
+    screencast = FakeScreenCast(None, _responses(start_results={"streams": [(42, {})]}))
+    bus = FakeBus(screencast)
+
+    with patch("pydbus.SessionBus", return_value=bus):
+        capture = ScreenCapture(source_type="screen")
+        assert capture._setup_portal_session() is True
+        assert "/session/1" in bus.con.subscriptions
+        capture.stop_pipeline()
+
+    assert "/session/1" not in bus.con.subscriptions
 
 
 def test_failure_without_stored_token_does_not_retry():

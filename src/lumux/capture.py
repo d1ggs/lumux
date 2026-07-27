@@ -46,6 +46,8 @@ class ScreenCapture:
         self._portal_node_id: Optional[int] = None
         self._portal_session_handle: Optional[str] = None
         self._portal_bus = None
+        self._session_closed_sub: Optional[int] = None
+        self._next_portal_retry = 0.0
 
         self._pipeline: Optional[Gst.Pipeline] = None
         self._appsink: Optional[GstApp.AppSink] = None
@@ -143,8 +145,15 @@ class ScreenCapture:
                 return self._process_image(frame)
 
         if not self._portal_node_id:
-            if not self._setup_portal_session():
+            # Rate-limit portal handshakes: without this, a session the
+            # compositor refuses to restore (e.g. while the screen is
+            # locked) would be re-requested once per frame.
+            if time.monotonic() < self._next_portal_retry:
                 return None
+            if not self._setup_portal_session():
+                self._next_portal_retry = time.monotonic() + 5.0
+                return None
+            self._next_portal_retry = 0.0
 
         if not self._pipeline_running:
             if not self._start_pipeline():
@@ -329,6 +338,20 @@ class ScreenCapture:
             if state["node_id"]:
                 self._portal_node_id = state["node_id"]
                 print(f"Portal session started. PipeWire node: {self._portal_node_id}")
+
+                # The compositor can kill the session while we're running
+                # (screen lock, monitor mode change, permission revoked).
+                # Without this subscription the pipeline keeps pushing into
+                # a dead PipeWire node and capture never recovers.
+                self._session_closed_sub = bus.con.signal_subscribe(
+                    None,
+                    "org.freedesktop.portal.Session",
+                    "Closed",
+                    self._portal_session_handle,
+                    None,
+                    0,
+                    self._on_session_closed_signal,
+                )
 
                 new_token = state["restore_token"]
                 if new_token and new_token != self._restore_token:
@@ -600,7 +623,31 @@ class ScreenCapture:
             print(f"Error processing frame: {e}")
             return Gst.FlowReturn.OK
 
+    def _on_session_closed_signal(
+        self, connection, sender, path, interface, signal, params
+    ):
+        if path != self._portal_session_handle:
+            return
+        print("Portal session closed by the compositor; stopping capture pipeline")
+        self._unsubscribe_session_closed()
+        # The session is already gone remotely - drop the handle without
+        # calling Close() on it, and tear down the pipeline so the next
+        # capture() re-runs the portal handshake (restore token skips the
+        # picker).
+        self._portal_session_handle = None
+        self._portal_node_id = None
+        self._stop_gst_pipeline()
+
+    def _unsubscribe_session_closed(self):
+        if self._session_closed_sub is not None and self._portal_bus is not None:
+            try:
+                self._portal_bus.con.signal_unsubscribe(self._session_closed_sub)
+            except Exception:
+                pass
+        self._session_closed_sub = None
+
     def _close_portal_session(self):
+        self._unsubscribe_session_closed()
         if self._portal_session_handle and self._portal_bus:
             try:
                 session = self._portal_bus.get(

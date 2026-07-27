@@ -14,7 +14,7 @@ Public API:
     BlackBarDetector — letterbox/pillarbox detection
 """
 
-__version__ = "0.6.3"
+__version__ = "0.6.4"
 __author__ = "Engin Kırmacı"
 
 # Re-export commonly used classes for convenience
