@@ -77,6 +77,20 @@
   </branding>
 
   <releases>
+    <release version="0.6.5" date="2026-07-28">
+      <description>
+        <p>Survive screen blanking without prompting or dropping the lights:</p>
+        <ul>
+          <li>Defer the screen-share handshake while the screen is blanked, so the saved permission is reused instead of being spent on an attempt the compositor cannot serve (this was the cause of the share dialog reappearing after the screen came back)</li>
+          <li>Keep the screen-share permission when a handshake fails for unrelated reasons, and save refreshed permissions even when the attempt then fails</li>
+          <li>Bound every stage of the screen-share handshake with a timeout, and always release its resources, so a stalled request can no longer spawn a pile-up of share dialogs</li>
+          <li>Reconnect the entertainment stream automatically when it drops, instead of staying dark until sync is restarted</li>
+          <li>Run the entertainment keepalive independently of screen capture, so a slow handshake cannot let the bridge time the session out</li>
+          <li>Report why activating entertainment streaming failed instead of failing silently</li>
+          <li>Fix a crash when the portal returns an empty stream list</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.4" date="2026-07-27">
       <description>
         <p>Survive compositor screencast interruptions:</p>

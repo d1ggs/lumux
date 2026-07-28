@@ -324,7 +324,8 @@ class BridgeClient:
                 json_data={"action": "start"},
             )
             return True
-        except BridgeError:
+        except BridgeError as e:
+            print(f"Error activating entertainment streaming for {config_id}: {e}")
             return False
 
     def deactivate_entertainment_streaming(

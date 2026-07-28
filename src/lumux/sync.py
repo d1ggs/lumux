@@ -35,6 +35,7 @@ class SyncController:
 
         self.running = False
         self.thread: Optional[threading.Thread] = None
+        self._keepalive_thread: Optional[threading.Thread] = None
         self.previous_colors: Dict[str, Tuple[Tuple[float, float], int]] = {}
         self.queue: queue.Queue = queue.Queue(maxsize=100)
         self.lock = threading.Lock()
@@ -57,6 +58,17 @@ class SyncController:
         self._last_channel_colors: Optional[Dict] = None
         self._last_send_time = 0.0
         self._keepalive_interval = 5.0
+        # How often the keepalive thread wakes to check the interval above.
+        # Runs independently of _sync_loop/_process_frame so a capture()
+        # call blocked inside a portal handshake (which can legitimately
+        # take minutes while waiting on the user, e.g. after waking the
+        # monitor from a blank) can never starve the keepalive.
+        self._keepalive_poll_interval = 1.0
+
+        # Rate-limits reconnect attempts once the DTLS session is found
+        # dead (see _ensure_entertainment_connected).
+        self._next_entertainment_retry = 0.0
+        self._entertainment_retry_interval = 5.0
 
         self._stats = {
             "fps": 0,
@@ -99,6 +111,17 @@ class SyncController:
             target=self._sync_loop, daemon=True, name="SyncLoop"
         )
         self.thread.start()
+
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop, daemon=True, name="EntertainmentKeepalive"
+        )
+        self._keepalive_thread.start()
+
+    def _keepalive_loop(self):
+        """Independent of _sync_loop - see _keepalive_poll_interval."""
+        while self.running:
+            self._maybe_send_keepalive()
+            time.sleep(self._keepalive_poll_interval)
 
     def _build_zone_channel_mapping(self):
         """Build mapping from screen zones to entertainment channels based on positions."""
@@ -208,6 +231,11 @@ class SyncController:
             if self.thread.is_alive():
                 timed_print("Warning: Sync thread did not stop cleanly")
 
+        if self._keepalive_thread:
+            self._keepalive_thread.join(timeout=3)
+            if self._keepalive_thread.is_alive():
+                timed_print("Warning: Keepalive thread did not stop cleanly")
+
         # Stop the capture pipeline to release portal session
         if hasattr(self.capture, "stop_pipeline"):
             self.capture.stop_pipeline()
@@ -288,7 +316,6 @@ class SyncController:
         screen = self.capture.capture()
         t_capture = time.time() - t_capture
         if screen is None:
-            self._maybe_send_keepalive()
             return
 
         t_zones = time.time()
@@ -334,10 +361,7 @@ class SyncController:
         if not hue_colors:
             return
 
-        if (
-            not self.entertainment_stream
-            or not self.entertainment_stream.is_connected()
-        ):
+        if not self._ensure_entertainment_connected():
             if self._stats["frame_count"] % 300 == 0:
                 timed_print(
                     "Warning: Entertainment stream not connected, skipping update"
@@ -367,28 +391,61 @@ class SyncController:
         # Send to all channels via DTLS, unless pause_sending() was called
         if channel_colors and not self._send_paused:
             self.entertainment_stream.send_colors_xy(channel_colors)
-            self._last_channel_colors = channel_colors
-            self._last_send_time = time.monotonic()
+            with self.lock:
+                self._last_channel_colors = channel_colors
+                self._last_send_time = time.monotonic()
 
     def _maybe_send_keepalive(self):
         """Repeat the last sent frame if nothing has gone out recently.
 
-        Called when a frame produced nothing to send (capture stalled).
-        Not sending for ~10s makes the bridge silently kill the
-        entertainment session, which the client cannot detect - so keep it
-        alive until capture recovers.
+        Runs on its own thread (_keepalive_loop), independent of
+        _process_frame/_sync_loop: capture() can block for a long time
+        inside a portal handshake (e.g. waiting on the user after the
+        monitor wakes from a blank), and not sending for ~10s makes the
+        bridge silently kill the entertainment session - a stall the
+        client cannot otherwise detect - so keep it alive until capture
+        recovers.
         """
-        if self._send_paused or self._last_channel_colors is None:
+        with self.lock:
+            if self._send_paused or self._last_channel_colors is None:
+                return
+            if time.monotonic() - self._last_send_time < self._keepalive_interval:
+                return
+            colors = self._last_channel_colors
+
+        if not self._ensure_entertainment_connected():
             return
-        if time.monotonic() - self._last_send_time < self._keepalive_interval:
-            return
-        if (
-            not self.entertainment_stream
-            or not self.entertainment_stream.is_connected()
-        ):
-            return
-        self.entertainment_stream.send_colors_xy(self._last_channel_colors)
-        self._last_send_time = time.monotonic()
+        self.entertainment_stream.send_colors_xy(colors)
+        with self.lock:
+            self._last_send_time = time.monotonic()
+
+    def _ensure_entertainment_connected(self) -> bool:
+        """Reconnect the DTLS entertainment stream if it died.
+
+        is_connected() only reflects a stream that was connected once and
+        has not since failed (bridge-side silence timeout, network blip,
+        the local process exiting) - nothing else in this class
+        re-establishes it, so without this the lights stay dark forever
+        after any disconnect until sync is manually restarted.
+        """
+        if not self.entertainment_stream:
+            return False
+        with self.lock:
+            if self.entertainment_stream.is_connected():
+                return True
+            if time.monotonic() < self._next_entertainment_retry:
+                return False
+            if not self.bridge or not self.entertainment_stream.connect(self.bridge):
+                self._next_entertainment_retry = (
+                    time.monotonic() + self._entertainment_retry_interval
+                )
+                return False
+            self._next_entertainment_retry = 0.0
+        # The zone-channel map built in start() is still valid: it's keyed
+        # off physical channel positions, which a reconnect to the same
+        # entertainment config does not change.
+        timed_print("Entertainment stream reconnected")
+        return True
 
     def _queue_status(self, status_type: str, message, data=None):
         """Queue status update for GUI thread."""

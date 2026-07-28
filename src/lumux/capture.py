@@ -3,6 +3,7 @@
 import re
 import time
 import threading
+from contextlib import contextmanager
 from typing import Callable, Optional, List, Set, TYPE_CHECKING
 
 import numpy as np
@@ -29,6 +30,17 @@ _PERSIST_UNTIL_REVOKED = 2
 
 
 class ScreenCapture:
+    # CreateSession/Start are machine-only D-Bus round trips; SelectSources
+    # shows the share picker to the user and must survive however long it
+    # takes them to notice it (e.g. right after waking the monitor from a
+    # blank), so it gets a much longer allowance.
+    _CREATE_SESSION_TIMEOUT_S = 30
+    _SELECT_SOURCES_TIMEOUT_S = 120
+    _START_TIMEOUT_S = 15
+    # Poll interval while waiting for a blanked screen to come back. Short, so
+    # sync resumes promptly on wake; the probe is a cheap local D-Bus call.
+    _BLANKED_RETRY_S = 2.0
+
     def __init__(
         self,
         scale_factor: float = 0.125,
@@ -44,12 +56,14 @@ class ScreenCapture:
         self._restore_token = restore_token or None
         self._on_restore_token = on_restore_token
         self._token_rejected = False
+        self._token_consumed = False
 
         self._portal_node_id: Optional[int] = None
         self._portal_session_handle: Optional[str] = None
         self._portal_bus = None
         self._session_closed_sub: Optional[int] = None
         self._next_portal_retry = 0.0
+        self._blanked_logged = False
 
         self._pipeline: Optional[Gst.Pipeline] = None
         self._appsink: Optional[GstApp.AppSink] = None
@@ -166,6 +180,20 @@ class ScreenCapture:
             # locked) would be re-requested once per frame.
             if time.monotonic() < self._next_portal_retry:
                 return None
+            if self._screen_is_blanked():
+                # There is nothing to capture anyway; waiting preserves the
+                # restore token so the screen coming back restores silently.
+                if not self._blanked_logged:
+                    print(
+                        "Screen is blanked; deferring portal handshake until "
+                        "it returns"
+                    )
+                    self._blanked_logged = True
+                self._next_portal_retry = (
+                    time.monotonic() + self._BLANKED_RETRY_S
+                )
+                return None
+            self._blanked_logged = False
             if not self._setup_portal_session():
                 self._next_portal_retry = time.monotonic() + 5.0
                 return None
@@ -221,6 +249,35 @@ class ScreenCapture:
             )
         return screen
 
+    @staticmethod
+    @contextmanager
+    def _run_loop_with_timeout(loop, timeout_s):
+        """Run `loop` until it quits or `timeout_s` elapses.
+
+        Yields a callable reporting whether the watchdog fired. The timeout
+        source is ALWAYS removed: a surviving source would fire later, during
+        a subsequent attempt's nested main loop, and quit it prematurely -
+        which collapses the retry backoff into a dialog storm.
+        """
+        timed_out = False
+
+        def _on_timeout():
+            nonlocal timed_out
+            timed_out = True
+            loop.quit()
+            return False
+
+        source_id = GLib.timeout_add_seconds(timeout_s, _on_timeout)
+        try:
+            loop.run()
+            yield lambda: timed_out
+        finally:
+            if not timed_out:
+                try:
+                    GLib.source_remove(source_id)
+                except Exception:
+                    pass
+
     def _setup_portal_session(self) -> bool:
         self._token_rejected = False
         if self._try_setup_portal_session():
@@ -239,7 +296,60 @@ class ScreenCapture:
             return self._try_setup_portal_session()
         return False
 
+    def _screen_is_blanked(self) -> bool:
+        """True when the compositor has the screen blanked or locked.
+
+        A portal handshake cannot be served in that state: GNOME will not
+        restore a screencast behind the shield, and the doomed attempt may
+        cost us our single-use restore token - which is what forces a share
+        picker once the screen comes back. Any probe failure returns False so
+        desktops without this service behave exactly as before.
+        """
+        try:
+            import pydbus
+
+            saver = pydbus.SessionBus().get(
+                "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver"
+            )
+            return bool(saver.GetActive())
+        except Exception:
+            return False
+
+    def _persist_new_token(self, new_token: Optional[str]) -> None:
+        """Store a token the portal just issued, notifying the owner."""
+        if not new_token or new_token == self._restore_token:
+            return
+        print(
+            f"[capture] Screen-share consent cached "
+            f"(token length {len(new_token)}) — will skip prompt on next sync"
+        )
+        self._restore_token = new_token
+        self._token_consumed = False
+        if self._on_restore_token:
+            try:
+                self._on_restore_token(new_token)
+            except Exception as e:
+                print(f"Error persisting restore token: {e}")
+
     def _try_setup_portal_session(self) -> bool:
+        self._token_consumed = False
+        if self._do_setup_portal_session():
+            return True
+        # A session that was created but never Started still owns its
+        # share-picker dialog. Dropping the handle without closing it leaves
+        # that dialog on screen, so every retry stacks another one.
+        if self._portal_session_handle:
+            self._close_portal_session()
+        # Deliberately KEEP the restore token here. A handshake can fail for
+        # reasons that say nothing about the token's validity (most commonly:
+        # attempted while the compositor had the screen blanked), and whether
+        # such an attempt consumed it is not observable. Discarding a
+        # possibly-valid token guarantees a share picker on the next attempt;
+        # keeping a dead one costs nothing, because the portal rejects it
+        # explicitly and the _token_rejected path clears it then.
+        return False
+
+    def _do_setup_portal_session(self) -> bool:
         try:
             import pydbus
 
@@ -271,7 +381,10 @@ class ScreenCapture:
                     state["session_handle"] = results["session_handle"]
                     loop.quit()
                 elif "streams" in results:
-                    state["node_id"] = results["streams"][0][0]
+                    # An empty stream list is possible (and used to raise
+                    # IndexError here, killing the handshake mid-flight).
+                    streams = results["streams"]
+                    state["node_id"] = streams[0][0] if streams else None
                     # The Start response may carry a restore_token when
                     # persistent consent was granted; persist it for next time.
                     state["restore_token"] = results.get("restore_token")
@@ -312,9 +425,11 @@ class ScreenCapture:
                 0,
                 on_response,
             )
-            GLib.timeout_add_seconds(30, loop.quit)
             try:
-                loop.run()
+                with self._run_loop_with_timeout(
+                    loop, self._CREATE_SESSION_TIMEOUT_S
+                ):
+                    pass
             finally:
                 bus.con.signal_unsubscribe(sub)
 
@@ -332,6 +447,11 @@ class ScreenCapture:
                 select_sources_options["restore_token"] = GLib.Variant(
                     "s", self._restore_token
                 )
+                # Restore tokens are single-use: the portal invalidates this
+                # one the moment SelectSources receives it and returns a
+                # replacement in the Start response. Our stored copy is dead
+                # from here on, whatever happens next.
+                self._token_consumed = True
 
             loop = GLib.MainLoop()
             try:
@@ -341,7 +461,11 @@ class ScreenCapture:
                 )
             except Exception:
                 if "restore_token" in select_sources_options:
+                    # Refused outright, not accepted-and-invalidated: the
+                    # _token_rejected path clears and retries without it, so
+                    # this must not also count as consumed (double clear).
                     self._token_rejected = True
+                    self._token_consumed = False
                 raise
             sub = bus.con.signal_subscribe(
                 None,
@@ -352,10 +476,24 @@ class ScreenCapture:
                 0,
                 on_response,
             )
+            timed_out = False
             try:
-                loop.run()
+                with self._run_loop_with_timeout(
+                    loop, self._SELECT_SOURCES_TIMEOUT_S
+                ) as select_sources_timed_out:
+                    timed_out = select_sources_timed_out()
             finally:
                 bus.con.signal_unsubscribe(sub)
+
+            if timed_out:
+                print(
+                    "Screen-share selection timed out waiting for a user "
+                    "response; aborting this portal attempt"
+                )
+                return False
+            if state["error"] is not None:
+                print(f"Screen-share selection was rejected (code {state['error']})")
+                return False
 
             loop = GLib.MainLoop()
             req = screencast.Start(self._portal_session_handle, "", {})
@@ -369,9 +507,15 @@ class ScreenCapture:
                 on_response,
             )
             try:
-                loop.run()
+                with self._run_loop_with_timeout(loop, self._START_TIMEOUT_S):
+                    pass
             finally:
                 bus.con.signal_unsubscribe(sub)
+
+            # Persist any rotated token BEFORE deciding success: the Start
+            # response's token is the only valid one from now on, so losing
+            # it because no node arrived would strand us on a dead token.
+            self._persist_new_token(state["restore_token"])
 
             if state["node_id"]:
                 self._portal_node_id = state["node_id"]
@@ -390,20 +534,6 @@ class ScreenCapture:
                     0,
                     self._on_session_closed_signal,
                 )
-
-                new_token = state["restore_token"]
-                if new_token and new_token != self._restore_token:
-                    print(
-                        f"[capture] Screen-share consent cached "
-                        f"(token length {len(new_token)}) — "
-                        "will skip prompt on next sync"
-                    )
-                    self._restore_token = new_token
-                    if self._on_restore_token:
-                        try:
-                            self._on_restore_token(new_token)
-                        except Exception as e:
-                            print(f"Error persisting restore token: {e}")
 
                 return True
 

@@ -73,6 +73,8 @@ Thumbs.db
 # Flatpak build
 flatpak/build/
 flatpak/.flatpak-builder/
+# flatpak-builder invoked from the repo root caches here instead
+/.flatpak-builder/
 
 # Test outputs & logs
 *.log

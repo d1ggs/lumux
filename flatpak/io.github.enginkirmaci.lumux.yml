@@ -17,6 +17,10 @@ finish-args:
   # Screen capture via portals / PipeWire
   - --filesystem=xdg-run/pipewire-0
 
+  # Detect a blanked/locked screen, so the portal handshake is deferred
+  # instead of failing and burning the single-use restore token
+  - --talk-name=org.gnome.ScreenSaver
+
   # System tray support via StatusNotifierItem (D-Bus)
   - --talk-name=org.kde.StatusNotifierWatcher
   - --talk-name=org.freedesktop.StatusNotifierWatcher

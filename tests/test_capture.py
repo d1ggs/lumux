@@ -73,13 +73,27 @@ class FakeScreenCast:
         return self._fire_response("Start")
 
 
+class FakeSession:
+    """Stand-in for an org.freedesktop.portal.Session proxy."""
+
+    def __init__(self, handle, closed_sessions):
+        self._handle = handle
+        self._closed_sessions = closed_sessions
+
+    def Close(self):
+        self._closed_sessions.append(self._handle)
+
+
 class FakeBus:
     def __init__(self, screencast):
         self.con = FakeConnection()
         screencast._connection = self.con
         self._screencast = screencast
+        self.closed_sessions = []
 
     def get(self, name, path):
+        if path is not None and str(path).startswith("/session/"):
+            return FakeSession(path, self.closed_sessions)
         return {"org.freedesktop.portal.ScreenCast": self._screencast}
 
 
@@ -327,3 +341,212 @@ def test_failure_without_stored_token_does_not_retry():
         assert capture._setup_portal_session() is False
 
     assert len(screencast.select_sources_calls) == 1
+
+
+class HangingSelectSourcesScreenCast(FakeScreenCast):
+    """SelectSources never delivers a Response - simulates the portal
+    withholding the share picker while the monitor is off."""
+
+    def SelectSources(self, session_handle, options):
+        self.select_sources_calls.append(options)
+        self._request_counter += 1
+        return f"/org/freedesktop/portal/desktop/request/_/r{self._request_counter}"
+
+
+def test_select_sources_timeout_returns_false_without_hanging():
+    screencast = HangingSelectSourcesScreenCast(
+        None, _responses(start_results={"streams": [(42, {})]})
+    )
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        with patch.object(ScreenCapture, "_SELECT_SOURCES_TIMEOUT_S", 0):
+            capture = ScreenCapture(source_type="screen")
+            assert capture._setup_portal_session() is False
+
+
+class HangingStartScreenCast(FakeScreenCast):
+    """Start never delivers a Response - simulates a portal session that
+    went stale while SelectSources was waiting on the user."""
+
+    def Start(self, session_handle, parent_window, options):
+        self._request_counter += 1
+        return f"/org/freedesktop/portal/desktop/request/_/r{self._request_counter}"
+
+
+def test_start_timeout_returns_false_without_hanging():
+    screencast = HangingStartScreenCast(None, _responses(start_results={}))
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        with patch.object(ScreenCapture, "_START_TIMEOUT_S", 0):
+            capture = ScreenCapture(source_type="screen")
+            assert capture._setup_portal_session() is False
+
+
+def test_token_is_retained_when_a_handshake_fails_ambiguously():
+    """A restore that fails without the portal explicitly rejecting the token
+    (e.g. attempted while the compositor had the screen blanked) must NOT
+    discard it. Whether such an attempt really consumed the token is not
+    observable, and throwing away a possibly-valid one guarantees a share
+    picker, whereas keeping it costs nothing: an actually-dead token is
+    cleared by the InvalidArgument path instead."""
+    screencast = HangingSelectSourcesScreenCast(
+        None, _responses(start_results={"streams": [(42, {})]})
+    )
+    saved_tokens = []
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        with patch.object(ScreenCapture, "_SELECT_SOURCES_TIMEOUT_S", 0):
+            capture = ScreenCapture(
+                source_type="screen",
+                restore_token="MAYBE-STILL-GOOD",
+                on_restore_token=saved_tokens.append,
+            )
+            assert capture._setup_portal_session() is False
+
+    assert capture._restore_token == "MAYBE-STILL-GOOD"
+    assert saved_tokens == []
+
+
+def test_capture_defers_portal_setup_while_the_screen_is_blanked():
+    """The compositor cannot serve a screencast restore while the shield is
+    up; attempting anyway fails and risks burning the single-use restore
+    token, which is what forces a share picker once the screen returns."""
+    screencast = FakeScreenCast(None, _responses(start_results={"streams": [(42, {})]}))
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture = ScreenCapture(source_type="screen", restore_token="KEEP-ME")
+        with patch.object(capture, "_screen_is_blanked", return_value=True):
+            assert capture.capture() is None
+
+    assert screencast.create_session_calls == []
+    assert capture._restore_token == "KEEP-ME"
+
+
+def test_capture_sets_up_portal_once_the_screen_is_back():
+    screencast = FakeScreenCast(None, _responses(start_results={"streams": [(42, {})]}))
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture = ScreenCapture(source_type="screen")
+        with patch.object(capture, "_screen_is_blanked", return_value=True):
+            assert capture.capture() is None
+        assert screencast.create_session_calls == []
+
+        capture._next_portal_retry = 0.0  # blanked-backoff elapsed
+        with patch.object(capture, "_screen_is_blanked", return_value=False):
+            with patch.object(capture, "_start_pipeline", return_value=False):
+                assert capture.capture() is None
+
+    assert len(screencast.create_session_calls) == 1
+
+
+def test_unavailable_screensaver_service_does_not_block_capture():
+    """On a desktop without org.gnome.ScreenSaver the probe must fail open,
+    otherwise capture would never start there."""
+    screencast = FakeScreenCast(None, _responses(start_results={"streams": [(42, {})]}))
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture = ScreenCapture(source_type="screen")
+        # FakeBus.get() returns a dict with no GetActive method, standing in
+        # for the name being absent from the bus.
+        assert capture._screen_is_blanked() is False
+
+
+def test_new_token_is_persisted_even_when_start_yields_no_node():
+    """The Start response can carry a fresh token while still failing to
+    give us a node. That token is the only valid one from then on, so it
+    must be persisted rather than discarded with the failure."""
+
+    class NoNodeButTokenScreenCast(FakeScreenCast):
+        def Start(self, session_handle, parent_window, options):
+            self._request_counter += 1
+            path = (
+                "/org/freedesktop/portal/desktop/request/_/"
+                f"r{self._request_counter}"
+            )
+
+            def _deliver():
+                cb = self._connection.subscriptions.get(path)
+                if cb is not None:
+                    cb(
+                        None,
+                        None,
+                        path,
+                        "org.freedesktop.portal.Request",
+                        "Response",
+                        (0, {"streams": [], "restore_token": "ROTATED"}),
+                    )
+                return False
+
+            GLib.idle_add(_deliver)
+            return path
+
+    screencast = NoNodeButTokenScreenCast(None, _responses(start_results={}))
+    saved_tokens = []
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture = ScreenCapture(
+            source_type="screen",
+            restore_token="OLD",
+            on_restore_token=saved_tokens.append,
+        )
+        assert capture._setup_portal_session() is False
+
+    assert capture._restore_token == "ROTATED"
+    assert saved_tokens == ["ROTATED"]
+
+
+def _track_glib_timeout_sources():
+    """Patch GLib timeout add/remove so a test can assert every source the
+    portal handshake creates is also destroyed. Calls through to the real
+    functions so the sources genuinely go away."""
+    added, removed = [], []
+    real_add = GLib.timeout_add_seconds
+    real_remove = GLib.source_remove
+
+    def tracking_add(interval, callback, *args):
+        source_id = real_add(interval, callback, *args)
+        added.append(source_id)
+        return source_id
+
+    def tracking_remove(source_id):
+        removed.append(source_id)
+        return real_remove(source_id)
+
+    return added, removed, tracking_add, tracking_remove
+
+
+def test_portal_handshake_removes_its_timeout_sources():
+    """Each handshake stage arms a GLib timeout as a watchdog. Leaving those
+    sources alive lets them fire during a LATER attempt's nested main loop
+    and quit it prematurely, which collapses the retry backoff and spams the
+    user with share-picker dialogs."""
+    screencast = FakeScreenCast(None, _responses(start_results={"streams": [(42, {})]}))
+    added, removed, tracking_add, tracking_remove = _track_glib_timeout_sources()
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        with patch.object(GLib, "timeout_add_seconds", tracking_add):
+            with patch.object(GLib, "source_remove", tracking_remove):
+                capture = ScreenCapture(source_type="screen")
+                assert capture._setup_portal_session() is True
+
+    assert added, "expected the handshake to arm timeout watchdogs"
+    leaked = sorted(set(added) - set(removed))
+    assert not leaked, f"leaked GLib timeout sources: {leaked}"
+
+
+def test_timed_out_handshake_closes_the_portal_session():
+    """A session created but never started must be closed on the way out;
+    otherwise its share-picker dialog stays on screen and every retry adds
+    another one."""
+    screencast = HangingSelectSourcesScreenCast(
+        None, _responses(start_results={"streams": [(42, {})]})
+    )
+    bus = FakeBus(screencast)
+
+    with patch("pydbus.SessionBus", return_value=bus):
+        with patch.object(ScreenCapture, "_SELECT_SOURCES_TIMEOUT_S", 0):
+            capture = ScreenCapture(source_type="screen")
+            assert capture._setup_portal_session() is False
+
+    assert bus.closed_sessions == ["/session/1"]
+    assert capture._portal_session_handle is None
