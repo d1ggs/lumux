@@ -1,5 +1,6 @@
 """Screen capture using PipeWire portal with optimized GStreamer pipeline."""
 
+import os
 import re
 import time
 import threading
@@ -57,6 +58,8 @@ class ScreenCapture:
         self._on_restore_token = on_restore_token
         self._token_rejected = False
         self._token_consumed = False
+        self._token_counter = 0
+        self._token_lock = threading.Lock()
 
         self._portal_node_id: Optional[int] = None
         self._portal_session_handle: Optional[str] = None
@@ -296,6 +299,22 @@ class ScreenCapture:
             return self._try_setup_portal_session()
         return False
 
+    def _next_token(self, prefix: str) -> str:
+        """Return a token unique to this process, for portal object paths.
+
+        Both `handle_token` (Request path) and `session_handle_token` (Session
+        path) must be unique per request: the portal exports an object at a
+        path derived from them, and a collision fails with "An object is
+        already exported for the interface ... Request at ...". A wall-clock
+        seconds value is too coarse - back-to-back handshakes land in the same
+        second - and omitting handle_token entirely makes the portal reuse one
+        constant path for every request.
+        """
+        with self._token_lock:
+            self._token_counter += 1
+            counter = self._token_counter
+        return f"{prefix}{os.getpid()}_{counter}"
+
     def _screen_is_blanked(self) -> bool:
         """True when the compositor has the screen blanked or locked.
 
@@ -392,9 +411,9 @@ class ScreenCapture:
                 else:
                     loop.quit()
 
-            token = str(int(time.time()))
             create_options = {
-                "session_handle_token": GLib.Variant("s", "s" + token),
+                "session_handle_token": GLib.Variant("s", self._next_token("s")),
+                "handle_token": GLib.Variant("s", self._next_token("r")),
                 # persist_mode = 2: persist consent until explicitly revoked,
                 # so the portal can issue a restore_token for future sessions.
                 "persist_mode": GLib.Variant("u", 2),
@@ -441,6 +460,7 @@ class ScreenCapture:
             select_sources_options = {
                 "types": GLib.Variant("u", portal_types),
                 "multiple": GLib.Variant("b", False),
+                "handle_token": GLib.Variant("s", self._next_token("r")),
                 "persist_mode": GLib.Variant("u", _PERSIST_UNTIL_REVOKED),
             }
             if self._restore_token:
@@ -496,7 +516,11 @@ class ScreenCapture:
                 return False
 
             loop = GLib.MainLoop()
-            req = screencast.Start(self._portal_session_handle, "", {})
+            req = screencast.Start(
+                self._portal_session_handle,
+                "",
+                {"handle_token": GLib.Variant("s", self._next_token("r"))},
+            )
             sub = bus.con.signal_subscribe(
                 None,
                 "org.freedesktop.portal.Request",

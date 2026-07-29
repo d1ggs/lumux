@@ -33,6 +33,28 @@ class ZoneProcessor:
         """
         return self._process_ambilight(image)
 
+    @staticmethod
+    def _zone_bounds(index: int, count: int, extent: int) -> tuple[int, int]:
+        """Half-open bounds of zone `index` of `count` spanning `extent` px.
+
+        Proportional rather than a floored fixed stride, so the trailing
+        remainder is covered too (344 px over 16 zones used to sample only the
+        first 336, leaving the screen's right/bottom edge unread).
+
+        Always non-empty: a frame smaller than the zone grid - the black bar
+        detector crops an all-black frame, e.g. the first one after wake, down
+        to a few pixels - gave a zero stride and an empty slice, whose mean is
+        NaN, and int(NaN) raised and dropped the entire frame.
+        """
+        if extent <= 0:
+            return 0, 0
+        start = (index * extent) // count
+        end = ((index + 1) * extent) // count
+        if end <= start:
+            start = min(start, extent - 1)
+            end = start + 1
+        return start, end
+
     def _process_ambilight(
         self, img_array: np.ndarray
     ) -> Dict[str, tuple[int, int, int]]:
@@ -59,16 +81,10 @@ class ZoneProcessor:
             left_count = self.rows
             right_count = self.rows
 
-            top_zone_width = width // top_count
-            bottom_zone_width = width // bottom_count
-            left_zone_height = height // left_count
-            right_zone_height = height // right_count
-
             zones = {}
 
             for i in range(top_count):
-                x1 = i * top_zone_width
-                x2 = min((i + 1) * top_zone_width, width)
+                x1, x2 = self._zone_bounds(i, top_count, width)
                 avg_color = np.mean(img_array[0:edge_width, x1:x2], axis=(0, 1))
                 zones[f"top_{i}"] = (
                     int(avg_color[0]),
@@ -77,8 +93,7 @@ class ZoneProcessor:
                 )
 
             for i in range(bottom_count):
-                x1 = i * bottom_zone_width
-                x2 = min((i + 1) * bottom_zone_width, width)
+                x1, x2 = self._zone_bounds(i, bottom_count, width)
                 y1 = max(0, height - edge_width)
                 avg_color = np.mean(img_array[y1:height, x1:x2], axis=(0, 1))
                 zones[f"bottom_{i}"] = (
@@ -88,8 +103,7 @@ class ZoneProcessor:
                 )
 
             for i in range(left_count):
-                y1 = i * left_zone_height
-                y2 = min((i + 1) * left_zone_height, height)
+                y1, y2 = self._zone_bounds(i, left_count, height)
                 avg_color = np.mean(img_array[y1:y2, 0:edge_width], axis=(0, 1))
                 zones[f"left_{i}"] = (
                     int(avg_color[0]),
@@ -98,8 +112,7 @@ class ZoneProcessor:
                 )
 
             for i in range(right_count):
-                y1 = i * right_zone_height
-                y2 = min((i + 1) * right_zone_height, height)
+                y1, y2 = self._zone_bounds(i, right_count, height)
                 x1 = max(0, width - edge_width)
                 avg_color = np.mean(img_array[y1:y2, x1:width], axis=(0, 1))
                 zones[f"right_{i}"] = (

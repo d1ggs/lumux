@@ -39,6 +39,7 @@ class FakeScreenCast:
         self._request_counter = 0
         self.select_sources_calls = []
         self.create_session_calls = []
+        self.start_calls = []
 
     def _fire_response(self, method_name):
         self._request_counter += 1
@@ -70,6 +71,7 @@ class FakeScreenCast:
         return self._fire_response("SelectSources")
 
     def Start(self, session_handle, parent_window, options):
+        self.start_calls.append(options)
         return self._fire_response("Start")
 
 
@@ -493,6 +495,56 @@ def test_new_token_is_persisted_even_when_start_yields_no_node():
 
     assert capture._restore_token == "ROTATED"
     assert saved_tokens == ["ROTATED"]
+
+
+def test_every_portal_request_gets_a_unique_handle_token():
+    """handle_token forms the Request object path
+    (/org/freedesktop/portal/desktop/request/SENDER/TOKEN). Omitting it makes
+    the portal fall back to a constant, so every request collides on one path
+    and fails with "An object is already exported ..." whenever a previous
+    Request has not been torn down yet - which is exactly the churn right
+    after wake, and it breaks the silent restore."""
+    screencast = FakeScreenCast(None, _responses(start_results={"streams": [(42, {})]}))
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture = ScreenCapture(source_type="screen")
+        assert capture._setup_portal_session() is True
+
+    tokens = [
+        screencast.create_session_calls[0].get("handle_token"),
+        screencast.select_sources_calls[0].get("handle_token"),
+        screencast.start_calls[0].get("handle_token"),
+    ]
+    assert all(t is not None for t in tokens), f"missing handle_token: {tokens}"
+    unpacked = [t.unpack() for t in tokens]
+    assert len(set(unpacked)) == 3, f"handle_tokens must all differ: {unpacked}"
+
+
+def test_handle_and_session_tokens_differ_across_back_to_back_handshakes():
+    """Two handshakes inside the same second must not reuse object paths;
+    a wall-clock seconds value is too coarse to guarantee that."""
+    screencast = FakeScreenCast(None, _responses(start_results={"streams": [(42, {})]}))
+
+    with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
+        capture = ScreenCapture(source_type="screen")
+        assert capture._setup_portal_session() is True
+        capture._portal_node_id = None
+        assert capture._setup_portal_session() is True
+
+    session_tokens = [
+        c["session_handle_token"].unpack() for c in screencast.create_session_calls
+    ]
+    assert len(set(session_tokens)) == 2, f"session tokens reused: {session_tokens}"
+
+    all_handles = [
+        c["handle_token"].unpack()
+        for c in (
+            screencast.create_session_calls
+            + screencast.select_sources_calls
+            + screencast.start_calls
+        )
+    ]
+    assert len(set(all_handles)) == len(all_handles), f"reused: {all_handles}"
 
 
 def _track_glib_timeout_sources():
