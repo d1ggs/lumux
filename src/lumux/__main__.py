@@ -45,6 +45,14 @@ class LumuxApp(Adw.Application):
         self._resume_video_after_wake = False
         self._wake_resume_attempts = 0
 
+    # Post-resume WiFi re-association + DHCP can take minutes (ath12k is
+    # especially slow), so after a short fast-poll burst keep retrying at a
+    # relaxed pace for ~5 minutes instead of giving up at ~20s.
+    WAKE_RETRY_FAST_SECS = 2
+    WAKE_RETRY_FAST_ATTEMPTS = 10
+    WAKE_RETRY_SLOW_SECS = 10
+    WAKE_RETRY_MAX_ATTEMPTS = 40  # 10*2s + 30*10s ≈ 5.3 min
+
     def _handle_signal(self, signum, frame):
         """Handle SIGTERM/SIGINT by triggering clean shutdown."""
         timed_print(f"Received signal {signum}, shutting down...")
@@ -114,7 +122,7 @@ class LumuxApp(Adw.Application):
             return
         self._resume_video_after_wake = False
         self._wake_resume_attempts = 0
-        GLib.timeout_add_seconds(2, self._try_resume_video_sync)
+        GLib.timeout_add_seconds(self.WAKE_RETRY_FAST_SECS, self._try_resume_video_sync)
 
     def _try_resume_video_sync(self):
         """GLib timeout callback: retry switch_to_video until the bridge is back."""
@@ -126,9 +134,21 @@ class LumuxApp(Adw.Application):
         if self.app_context.mode_manager.switch_to_video():
             timed_print("Wake: video sync resumed")
             return False
-        if self._wake_resume_attempts >= 10:
-            timed_print("Wake: giving up on resuming video sync after 10 attempts")
+        if self._wake_resume_attempts >= self.WAKE_RETRY_MAX_ATTEMPTS:
+            timed_print(
+                "Wake: giving up on resuming video sync after "
+                f"{self._wake_resume_attempts} attempts"
+            )
             return False
+        if self._wake_resume_attempts == self.WAKE_RETRY_FAST_ATTEMPTS:
+            timed_print(
+                "Wake: network still down, retrying every "
+                f"{self.WAKE_RETRY_SLOW_SECS}s for a few more minutes"
+            )
+            GLib.timeout_add_seconds(
+                self.WAKE_RETRY_SLOW_SECS, self._try_resume_video_sync
+            )
+            return False  # stop the fast timer; the slow one takes over
         return True
 
     def _auto_activate_reading_mode(self):
