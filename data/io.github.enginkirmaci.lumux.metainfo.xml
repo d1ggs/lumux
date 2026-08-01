@@ -77,6 +77,16 @@
   </branding>
 
   <releases>
+    <release version="0.6.6" date="2026-08-01">
+      <description>
+        <p>Fix two wake-from-suspend bugs and widen the wake-resume retry window:</p>
+        <ul>
+          <li>Give every screen-share portal request a unique token, so a handshake retried right after wake no longer collides with a not-yet-torn-down earlier request and falls back to the share picker</li>
+          <li>Fix a crash processing the first (all-black) frame after wake, which was discarding it and blocking the black-bar/ambilight detector; zone sampling is also now proportional to frame size, closing a small gap at the right and bottom edges</li>
+          <li>Keep retrying to resume video sync for several minutes after wake instead of giving up after about 20 seconds, since WiFi re-association can take longer than that</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.5" date="2026-07-28">
       <description>
         <p>Survive screen blanking without prompting or dropping the lights:</p>
