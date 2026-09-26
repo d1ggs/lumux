@@ -77,6 +77,14 @@
   </branding>
 
   <releases>
+    <release version="0.6.7" date="2026-09-26">
+      <description>
+        <p>Keep screen-share consent across screen locks on KDE Plasma:</p>
+        <ul>
+          <li>Detect a locked screen on KDE Plasma (org.freedesktop.ScreenSaver) as well as GNOME, and wait for it to return before restoring the screen share; restoring while the monitor was off made the KDE portal discard the saved consent, so the share picker reappeared after every lock</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.6" date="2026-08-01">
       <description>
         <p>Fix two wake-from-suspend bugs and widen the wake-resume retry window:</p>
