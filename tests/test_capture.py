@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from gi.repository import GLib
@@ -442,8 +443,8 @@ def test_capture_sets_up_portal_once_the_screen_is_back():
 
 
 def test_unavailable_screensaver_service_does_not_block_capture():
-    """On a desktop without org.gnome.ScreenSaver the probe must fail open,
-    otherwise capture would never start there."""
+    """On a desktop without any screensaver service the probe must fail
+    open, otherwise capture would never start there."""
     screencast = FakeScreenCast(None, _responses(start_results={"streams": [(42, {})]}))
 
     with patch("pydbus.SessionBus", return_value=FakeBus(screencast)):
@@ -451,6 +452,44 @@ def test_unavailable_screensaver_service_does_not_block_capture():
         # FakeBus.get() returns a dict with no GetActive method, standing in
         # for the name being absent from the bus.
         assert capture._screen_is_blanked() is False
+
+
+class _SaverBus:
+    """Session bus exposing only the given screensaver services."""
+
+    def __init__(self, services):
+        self._services = services
+
+    def get(self, name, path=None):
+        if name not in self._services:
+            raise Exception(f"The name {name} was not provided by any .service files")
+        active = self._services[name]
+        return SimpleNamespace(GetActive=lambda: active)
+
+
+def test_freedesktop_screensaver_lock_counts_as_blanked():
+    """KDE Plasma has no org.gnome.ScreenSaver; its lock state is only on
+    org.freedesktop.ScreenSaver. Missing it there let a handshake run while
+    locked, the KDE portal found no output to restore and deleted the
+    consent, and a share picker appeared after every lock."""
+    bus = _SaverBus({"org.freedesktop.ScreenSaver": True})
+    with patch("pydbus.SessionBus", return_value=bus):
+        capture = ScreenCapture(source_type="screen")
+        assert capture._screen_is_blanked() is True
+
+
+def test_unlocked_freedesktop_screensaver_does_not_block_capture():
+    bus = _SaverBus({"org.freedesktop.ScreenSaver": False})
+    with patch("pydbus.SessionBus", return_value=bus):
+        capture = ScreenCapture(source_type="screen")
+        assert capture._screen_is_blanked() is False
+
+
+def test_gnome_screensaver_still_detected_without_freedesktop_service():
+    bus = _SaverBus({"org.gnome.ScreenSaver": True})
+    with patch("pydbus.SessionBus", return_value=bus):
+        capture = ScreenCapture(source_type="screen")
+        assert capture._screen_is_blanked() is True
 
 
 def test_new_token_is_persisted_even_when_start_yields_no_node():

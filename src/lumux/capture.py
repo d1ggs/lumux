@@ -319,20 +319,30 @@ class ScreenCapture:
         """True when the compositor has the screen blanked or locked.
 
         A portal handshake cannot be served in that state: GNOME will not
-        restore a screencast behind the shield, and the doomed attempt may
-        cost us our single-use restore token - which is what forces a share
-        picker once the screen comes back. Any probe failure returns False so
-        desktops without this service behave exactly as before.
+        restore a screencast behind the shield, and KDE finds no output to
+        restore once the monitor is off and deletes the consent outright.
+        Either way the doomed attempt costs us our restore token - which is
+        what forces a share picker once the screen comes back. GNOME exposes
+        its state on org.gnome.ScreenSaver, KDE only on the freedesktop name.
+        Any probe failure counts as not blanked so desktops without either
+        service behave exactly as before.
         """
         try:
             import pydbus
 
-            saver = pydbus.SessionBus().get(
-                "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver"
-            )
-            return bool(saver.GetActive())
+            bus = pydbus.SessionBus()
         except Exception:
             return False
+        for name, path in (
+            ("org.gnome.ScreenSaver", "/org/gnome/ScreenSaver"),
+            ("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver"),
+        ):
+            try:
+                if bus.get(name, path).GetActive():
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _persist_new_token(self, new_token: Optional[str]) -> None:
         """Store a token the portal just issued, notifying the owner."""
