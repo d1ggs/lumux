@@ -77,6 +77,14 @@
   </branding>
 
   <releases>
+    <release version="0.6.9" date="2026-10-07">
+      <description>
+        <p>Keep screen-share consent when the monitor wakes without a screen lock:</p>
+        <ul>
+          <li>Wait until the monitor list is non-empty and stable before restoring the screen share; monitors that briefly drop off the link on wake made the KDE portal discard the saved consent, so the share picker reappeared after every wake when auto-lock was off</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.8" date="2026-10-07">
       <description>
         <p>Remove the stray "OpenGL Renderer" entry from the dock:</p>
