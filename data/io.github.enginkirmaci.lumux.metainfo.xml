@@ -77,6 +77,14 @@
   </branding>
 
   <releases>
+    <release version="0.6.8" date="2026-10-07">
+      <description>
+        <p>Remove the stray "OpenGL Renderer" entry from the dock:</p>
+        <ul>
+          <li>GPU frame conversion now uses a headless EGL device when available, so GStreamer no longer creates an empty "OpenGL Renderer" window that showed up in the taskbar while sync was running</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.7" date="2026-09-26">
       <description>
         <p>Keep screen-share consent across screen locks on KDE Plasma:</p>
