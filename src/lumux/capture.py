@@ -83,6 +83,11 @@ class ScreenCapture:
     # Poll interval while waiting for a blanked screen to come back. Short, so
     # sync resumes promptly on wake; the probe is a cheap local D-Bus call.
     _BLANKED_RETRY_S = 2.0
+    # How long the monitor list must stay unchanged before a handshake is
+    # attempted. Some monitors (e.g. OLEDs on HDMI/DP) drop off the link and
+    # re-attach when they wake, so the output vanishes for a moment exactly
+    # when the compositor closes the screencast session.
+    _OUTPUT_SETTLE_S = 3.0
 
     def __init__(
         self,
@@ -109,6 +114,10 @@ class ScreenCapture:
         self._session_closed_sub: Optional[int] = None
         self._next_portal_retry = 0.0
         self._blanked_logged = False
+        # Written on the GTK main thread, read from the sync thread; plain
+        # attribute stores, so no lock is needed.
+        self._monitor_count: Optional[int] = None
+        self._monitors_changed_at: Optional[float] = None
 
         self._pipeline: Optional[Gst.Pipeline] = None
         self._appsink: Optional[GstApp.AppSink] = None
@@ -201,6 +210,28 @@ class ScreenCapture:
             self._display = Gdk.Display.get_default()
         except Exception as e:
             print(f"Error initializing display: {e}")
+            return
+        self._watch_monitors()
+
+    def _watch_monitors(self):
+        """Track how many monitors the compositor currently exposes.
+
+        Must run on the GTK main thread; the items-changed handler does too.
+        """
+        if self._display is None:
+            return
+        try:
+            monitors = self._display.get_monitors()
+            self._monitor_count = monitors.get_n_items()
+            monitors.connect("items-changed", self._on_monitors_changed)
+        except Exception as e:
+            print(f"Error watching monitors: {e}")
+            self._monitor_count = None
+
+    def _on_monitors_changed(self, monitors, position, removed, added):
+        self._monitor_count = monitors.get_n_items()
+        self._monitors_changed_at = time.monotonic()
+        print(f"Displays changed: {self._monitor_count} connected")
 
     @property
     def restore_token(self) -> str:
@@ -358,7 +389,8 @@ class ScreenCapture:
         return f"{prefix}{os.getpid()}_{counter}"
 
     def _screen_is_blanked(self) -> bool:
-        """True when the compositor has the screen blanked or locked.
+        """True when the compositor has the screen blanked, locked or has no
+        stable output to capture.
 
         A portal handshake cannot be served in that state: GNOME will not
         restore a screencast behind the shield, and KDE finds no output to
@@ -368,7 +400,20 @@ class ScreenCapture:
         its state on org.gnome.ScreenSaver, KDE only on the freedesktop name.
         Any probe failure counts as not blanked so desktops without either
         service behave exactly as before.
+
+        The lock check alone misses a monitor that wakes (or sleeps) without
+        a lock: if it drops off the link, KDE has no output for a moment and
+        the handshake fails the same way. So no monitors, or a monitor list
+        that changed within the last few seconds, counts as blanked too.
         """
+        if self._monitor_count == 0:
+            return True
+        changed_at = self._monitors_changed_at
+        if (
+            changed_at is not None
+            and time.monotonic() - changed_at < self._OUTPUT_SETTLE_S
+        ):
+            return True
         try:
             import pydbus
 
@@ -950,6 +995,11 @@ class ScreenCapture:
         self._portal_session_handle = None
         self._portal_node_id = None
         self._stop_gst_pipeline()
+        # The compositor usually closes the session because outputs are
+        # changing (monitor sleeping, waking or re-linking). Give them time
+        # to settle - and the monitor watcher time to report it - before the
+        # next handshake, which would otherwise spend the restore token.
+        self._next_portal_retry = time.monotonic() + self._OUTPUT_SETTLE_S
 
     def _unsubscribe_session_closed(self):
         if self._session_closed_sub is not None and self._portal_bus is not None:

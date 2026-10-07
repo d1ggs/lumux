@@ -290,6 +290,7 @@ def test_capture_reestablishes_session_after_session_closed():
         with patch.object(capture, "_start_pipeline", return_value=False):
             assert capture.capture() is None  # first portal setup
             _fire_session_closed(bus)
+            capture._next_portal_retry = 0.0  # output-settle delay elapsed
             assert capture.capture() is None  # must re-run the portal setup
 
     assert len(screencast.create_session_calls) == 2
@@ -697,3 +698,47 @@ def test_windowless_gl_respects_explicit_user_setting():
     )
     assert used is False
     assert value == "wayland"
+
+
+def test_session_closed_waits_for_outputs_to_settle_before_handshake():
+    """A monitor that re-links on wake vanishes for a moment exactly when the
+    compositor closes the session; an immediate handshake reaches the KDE
+    portal with no output, which deletes the stored consent."""
+    screencast = FakeScreenCast(None, _responses(start_results={"streams": [(42, {})]}))
+    bus = FakeBus(screencast)
+
+    with patch("pydbus.SessionBus", return_value=bus):
+        capture = ScreenCapture(source_type="screen")
+        with patch.object(capture, "_start_pipeline", return_value=False):
+            assert capture.capture() is None
+            _fire_session_closed(bus)
+            assert capture.capture() is None
+
+    assert len(screencast.create_session_calls) == 1
+
+
+def test_no_connected_monitor_counts_as_blanked():
+    capture = ScreenCapture(source_type="screen")
+    capture._monitor_count = 0
+    capture._monitors_changed_at = None
+    assert capture._screen_is_blanked() is True
+
+
+def test_recent_monitor_change_counts_as_blanked_until_settled():
+    capture = ScreenCapture(source_type="screen")
+    capture._monitor_count = 1
+    with patch("lumux.capture.time.monotonic", return_value=100.0):
+        capture._on_monitors_changed(SimpleNamespace(get_n_items=lambda: 1), 0, 0, 1)
+    with patch("pydbus.SessionBus", return_value=_SaverBus({})):
+        with patch("lumux.capture.time.monotonic", return_value=101.0):
+            assert capture._screen_is_blanked() is True
+        with patch("lumux.capture.time.monotonic", return_value=104.0):
+            assert capture._screen_is_blanked() is False
+
+
+def test_monitor_watcher_tracks_count_changes():
+    capture = ScreenCapture(source_type="screen")
+    capture._on_monitors_changed(SimpleNamespace(get_n_items=lambda: 0), 0, 1, 0)
+    assert capture._monitor_count == 0
+    capture._on_monitors_changed(SimpleNamespace(get_n_items=lambda: 1), 0, 0, 1)
+    assert capture._monitor_count == 1
