@@ -23,6 +23,48 @@ if TYPE_CHECKING:
 
 Gst.init(None)
 
+_windowless_gl_checked = False
+
+
+def _prefer_windowless_gl() -> bool:
+    """Make GstGL use a headless EGL device display when it works.
+
+    On Wayland GstGL's default backend creates an xdg_toplevel titled
+    "OpenGL Renderer" for its context, which shows up in docks and task
+    managers for as long as the GL pipeline runs. The egl-device backend
+    needs no window at all. GST_GL_WINDOW is read whenever a GL display is
+    created, so it can be set after Gst.init. Only keep it if a context can
+    actually be created; otherwise the GL pipelines would fail and silently
+    fall back to CPU conversion. An explicit user setting is left alone.
+    """
+    if "GST_GL_WINDOW" in os.environ:
+        return False
+    try:
+        gi.require_version("GstGL", "1.0")
+        from gi.repository import GstGL
+    except (ValueError, ImportError):
+        return False
+
+    os.environ["GST_GL_WINDOW"] = "egl-device"
+    try:
+        context = GstGL.GLContext.new(GstGL.GLDisplay.new())
+        if context is not None and context.create(None):
+            context.destroy()
+            return True
+    except GLib.Error:
+        pass
+    del os.environ["GST_GL_WINDOW"]
+    return False
+
+
+def _ensure_windowless_gl_checked() -> None:
+    global _windowless_gl_checked
+    if _windowless_gl_checked:
+        return
+    _windowless_gl_checked = True
+    if _prefer_windowless_gl():
+        print("Using headless EGL device for GStreamer GL (no renderer window)")
+
 # xdg-desktop-portal ScreenCast persist_mode values (portal interface v4+).
 # PERSIST_UNTIL_REVOKED keeps the grant across app restarts and reboots
 # until the user revokes it (e.g. GNOME Settings > Privacy > Screen
@@ -666,6 +708,7 @@ class ScreenCapture:
         if self._pipeline:
             self._stop_gst_pipeline()
 
+        _ensure_windowless_gl_checked()
         configs = self._get_pipeline_configs(self._portal_node_id)
         if not configs:
             print("No suitable GStreamer pipeline configuration found")

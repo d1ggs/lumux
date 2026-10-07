@@ -641,3 +641,59 @@ def test_timed_out_handshake_closes_the_portal_session():
 
     assert bus.closed_sessions == ["/session/1"]
     assert capture._portal_session_handle is None
+
+
+class _FakeGLContext:
+    def __init__(self, create_result):
+        self._create_result = create_result
+        self.destroyed = False
+
+    def create(self, other):
+        if isinstance(self._create_result, Exception):
+            raise self._create_result
+        return self._create_result
+
+    def destroy(self):
+        self.destroyed = True
+
+
+def _fake_gstgl(context):
+    return SimpleNamespace(
+        GLDisplay=SimpleNamespace(new=lambda: object()),
+        GLContext=SimpleNamespace(new=lambda display: context),
+    )
+
+
+def _run_prefer_windowless_gl(context, environ):
+    import gi.repository
+    from lumux import capture
+
+    with patch.dict("os.environ", environ, clear=True), \
+            patch.object(gi.repository, "GstGL", _fake_gstgl(context), create=True), \
+            patch("gi.require_version"):
+        used = capture._prefer_windowless_gl()
+        import os
+        return used, os.environ.get("GST_GL_WINDOW")
+
+
+def test_windowless_gl_is_used_when_egl_device_context_works():
+    context = _FakeGLContext(True)
+    used, value = _run_prefer_windowless_gl(context, {})
+    assert used is True
+    assert value == "egl-device"
+    assert context.destroyed
+
+
+def test_windowless_gl_is_reverted_when_context_creation_fails():
+    error = GLib.Error("Cannot create an GLX context from a non-X11 window")
+    used, value = _run_prefer_windowless_gl(_FakeGLContext(error), {})
+    assert used is False
+    assert value is None
+
+
+def test_windowless_gl_respects_explicit_user_setting():
+    used, value = _run_prefer_windowless_gl(
+        _FakeGLContext(True), {"GST_GL_WINDOW": "wayland"}
+    )
+    assert used is False
+    assert value == "wayland"
