@@ -67,3 +67,58 @@ def test_entertainment_lights_not_off_on_bridge_error():
     bridge._client.get_light = boom
 
     assert bridge.entertainment_lights_off("cfg") is False
+
+
+# --- Link-button polling (ported from upstream PR #23 by NickdeK) ---
+
+from unittest.mock import patch
+
+from lumux.bridge_client import BridgeAuthError, BridgeConnectionError
+
+CREDS = {"app_key": "new-app-key", "client_key": "CK"}
+
+
+def _create_user_with(outcomes):
+    """Run HueBridge.create_user with BridgeClient.create_user scripted."""
+    calls = []
+
+    def fake_create_user(ip, name):
+        calls.append(ip)
+        outcome = outcomes[len(calls) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    bridge = HueBridge("192.0.2.1", "")
+    with patch("lumux.hue_bridge.BridgeClient.create_user", side_effect=fake_create_user):
+        result = bridge.create_user("192.0.2.1", max_retries=5, retry_delay=0)
+    return bridge, result, calls
+
+
+def test_create_user_polls_until_link_button_pressed():
+    """The bridge refuses until its button is pressed: keep polling instead
+    of failing on the first attempt (the user may need to walk over)."""
+    not_pressed = BridgeAuthError("Bridge error: link button not pressed")
+
+    bridge, result, calls = _create_user_with([not_pressed, not_pressed, CREDS])
+
+    assert result == CREDS
+    assert len(calls) == 3
+    assert bridge.app_key == "new-app-key"
+
+
+def test_create_user_gives_up_after_max_retries():
+    not_pressed = BridgeAuthError("Bridge error: link button not pressed")
+
+    _, result, calls = _create_user_with([not_pressed] * 5)
+
+    assert result is None
+    assert len(calls) == 5
+
+
+def test_create_user_stops_at_once_when_bridge_unreachable():
+    """A wrong IP must not keep the wizard spinning for 90 s."""
+    _, result, calls = _create_user_with([BridgeConnectionError("timed out"), CREDS])
+
+    assert result is None
+    assert len(calls) == 1
