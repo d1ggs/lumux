@@ -156,3 +156,44 @@ def test_failed_handshake_returns_false(monkeypatch):
     stream, _ = _make_connected_stream()
 
     assert stream._establish_dtls_connection() is False
+
+
+def test_reconnect_closes_the_previous_dtls_client(monkeypatch):
+    """Each reconnect used to drop the old client without close(), leaking
+    its libssl session, context and BIO."""
+    import lumux.entertainment as ent
+
+    class FakeClient:
+        handshake_seconds = 0.03
+
+        def __init__(self, *a, **k):
+            pass
+
+        def connect(self):
+            pass
+
+    old = _ClosedDtls()
+    closed = []
+    old.close = lambda: closed.append(True)
+    monkeypatch.setattr(ent, "DtlsPskClient", FakeClient)
+    stream, _ = _make_connected_stream()
+    stream._dtls_socket = old
+
+    assert stream._establish_dtls_connection() is True
+    assert closed == [True]
+
+
+def test_disconnect_racing_is_connected_does_not_crash():
+    """disconnect() (GUI thread) can clear _dtls_socket while the sync
+    thread is inside is_connected()."""
+    stream, _ = _make_connected_stream()
+
+    class Racing(_ClosedDtls):
+        def is_open(self):
+            stream._dtls_socket = None  # concurrent disconnect()
+            return False
+
+    stream._dtls_socket = Racing()
+
+    assert stream.is_connected() is False
+

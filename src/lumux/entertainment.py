@@ -264,6 +264,8 @@ class EntertainmentStream:
 
     def _establish_dtls_connection(self) -> bool:
         """Establish the DTLS-PSK session to bridge port 2100 (in-process)."""
+        # Free the previous session's libssl objects before replacing it.
+        self._close_dtls()
         psk_identity = self._application_id or self.app_key
         client = DtlsPskClient(
             self.bridge_ip,
@@ -300,25 +302,26 @@ class EntertainmentStream:
 
     def _close_dtls(self) -> None:
         """Close the DTLS session (sends close_notify if still open)."""
-        if not self._dtls_socket:
+        client, self._dtls_socket = self._dtls_socket, None
+        if not client:
             return
         try:
-            self._dtls_socket.close()
+            client.close()
         except Exception:
             pass
-        finally:
-            self._dtls_socket = None
 
     def is_connected(self) -> bool:
         """Check if DTLS connection is active."""
-        if self._dtls_socket:
-            if self._dtls_socket.is_open():
+        # Local copy: disconnect() on another thread may clear the attribute.
+        client = self._dtls_socket
+        if client:
+            if client.is_open():
                 return self._connected
             if self._connected:
                 self._connected = False
                 timed_print(
                     "DTLS session ended unexpectedly: "
-                    f"{self._dtls_socket.close_reason or 'unknown reason'}"
+                    f"{client.close_reason or 'unknown reason'}"
                 )
             return False
         return self._connected
@@ -390,10 +393,11 @@ class EntertainmentStream:
 
     def _send_dtls_message(self, message: bytes) -> None:
         """Send a message over the DTLS connection (one record per message)."""
-        if not self._dtls_socket:
+        client = self._dtls_socket  # may be cleared by disconnect() concurrently
+        if not client:
             raise ConnectionError("No DTLS connection available")
         try:
-            self._dtls_socket.send(message)
+            client.send(message)
         except DtlsError as e:
             print(f"DTLS connection lost: {e}")
             self._connected = False

@@ -153,3 +153,14 @@ def test_psk_not_on_any_command_line(server):
     lines = [line for line in out.splitlines() if PSK_HEX in line and "s_server" not in line]
     assert lines == []
     client.close()
+
+
+def test_connect_cleans_up_and_raises_dtls_error_on_socket_errors():
+    """Non-TLS failures (unresolvable host, no route) must not leak the
+    socket or the libssl objects, and must surface as DtlsError."""
+    client = DtlsPskClient("host.invalid", 2100, IDENTITY, PSK_HEX, handshake_timeout=1)
+
+    with pytest.raises(DtlsError):
+        client.connect()
+
+    assert client._sock is None and client._ssl is None and client._ctx is None

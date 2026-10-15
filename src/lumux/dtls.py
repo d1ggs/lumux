@@ -166,6 +166,9 @@ class DtlsPskClient:
             except DtlsError:
                 self._close_locked(send_notify=False)
                 raise
+            except Exception as e:  # socket/DNS errors, e.g. no route to host
+                self._close_locked(send_notify=False)
+                raise DtlsError(f"connection setup failed: {e}") from e
 
     def _connect_locked(self) -> None:
         lib = self._lib
@@ -174,6 +177,8 @@ class DtlsPskClient:
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.connect((self.host, self.port))
         self._sock.setblocking(False)
+        # Resolved before any libssl object exists, so it can't leak one.
+        peer_ip = socket.inet_aton(self._sock.getpeername()[0])
 
         self._ctx = lib.SSL_CTX_new(lib.DTLS_client_method())
         if not self._ctx:
@@ -185,17 +190,18 @@ class DtlsPskClient:
         lib.SSL_CTX_set_psk_client_callback(self._ctx, self._psk_cb)
 
         self._ssl = lib.SSL_new(self._ctx)
+        if not self._ssl:
+            raise DtlsError(f"SSL_new failed: {_ssl_errors(lib)}")
         bio = lib.BIO_new_dgram(self._sock.fileno(), _BIO_NOCLOSE)
-        if not self._ssl or not bio:
-            raise DtlsError(f"SSL_new/BIO_new_dgram failed: {_ssl_errors(lib)}")
+        if not bio:
+            raise DtlsError(f"BIO_new_dgram failed: {_ssl_errors(lib)}")
         addr = lib.BIO_ADDR_new()
         try:
-            raw = socket.inet_aton(socket.gethostbyname(self.host))
-            lib.BIO_ADDR_rawmake(addr, socket.AF_INET, raw, 4, socket.htons(self.port))
+            lib.BIO_ADDR_rawmake(addr, socket.AF_INET, peer_ip, 4, socket.htons(self.port))
             lib.BIO_ctrl(bio, _BIO_CTRL_DGRAM_SET_CONNECTED, 0, addr)
         finally:
             lib.BIO_ADDR_free(addr)
-        lib.SSL_set_bio(self._ssl, bio, bio)  # SSL now owns the BIO
+        lib.SSL_set_bio(self._ssl, bio, bio)  # SSL now owns (and frees) the BIO
 
         started = time.monotonic()
         deadline = started + self.handshake_timeout
