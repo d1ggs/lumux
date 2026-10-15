@@ -6,6 +6,8 @@ before pause_sending() took effect must be dropped rather than landing
 after the blackout and re-lighting the lamp (see Task 14 review).
 """
 
+import subprocess
+
 from lumux.entertainment import ChannelInfo, EntertainmentStream
 
 
@@ -86,101 +88,71 @@ def test_send_colors_xy_still_works_without_blackout():
     assert len(sent) == 1
 
 
-class _ExitedProc:
-    returncode = 1
+class _ClosedDtls:
+    """DtlsPskClient stand-in whose session the peer has ended."""
 
-    def __init__(self, stderr=b"SSL3 alert read:fatal:handshake failure\n"):
-        self._stderr = stderr
-        self.communicate_calls = 0
+    close_reason = "peer closed the session (close_notify)"
 
-    def poll(self):
-        return self.returncode
+    def is_open(self):
+        return False
 
-    def communicate(self, timeout=None):
-        self.communicate_calls += 1
-        return b"", self._stderr
+    def close(self):
+        pass
 
 
-def test_unexpected_dtls_exit_is_logged_once(capsys):
+def test_unexpected_dtls_close_is_logged_once(capsys):
     """A bridge-side session kill used to be invisible: only the next
     reconnect showed up in the log, never why the old session died."""
     stream, _ = _make_connected_stream()
-    proc = _ExitedProc()
-    stream._openssl_proc = proc
+    stream._dtls_socket = _ClosedDtls()
 
     assert stream.is_connected() is False
     assert stream.is_connected() is False
 
     out = capsys.readouterr().out
-    assert out.count("DTLS session ended unexpectedly (exit code 1)") == 1
-    assert "handshake failure" in out
-    assert proc.communicate_calls == 1
+    assert out.count("DTLS session ended unexpectedly") == 1
+    assert "close_notify" in out
 
 
-import subprocess
-import sys
-import time as _time
+def test_establish_dtls_connection_uses_in_process_client(monkeypatch):
+    """The PSK must never be handed to a subprocess (visible in argv)."""
+    import lumux.entertainment as ent
 
+    created = {}
 
-def _fake_openssl(script):
-    """Real subprocess standing in for openssl s_client (stderr protocol)."""
-    return subprocess.Popen(
-        [sys.executable, "-c", script],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    class FakeClient:
+        handshake_seconds = 0.03
 
+        def __init__(self, host, port, identity, psk_hex, handshake_timeout):
+            created.update(host=host, port=port, identity=identity, psk=psk_hex)
 
-def _handshake_stream(script, timeout=2.0):
+        def connect(self):
+            pass
+
+    monkeypatch.setattr(ent, "DtlsPskClient", FakeClient)
+    def no_subprocess(*args, **kwargs):
+        raise AssertionError("spawned a subprocess")
+
+    monkeypatch.setattr(subprocess, "Popen", no_subprocess)
     stream, _ = _make_connected_stream()
-    stream._connected = False
-    stream._handshake_timeout = timeout
-    stream._openssl_proc = _fake_openssl(script)
-    return stream
+    stream._application_id = "app-id"
+
+    assert stream._establish_dtls_connection() is True
+    assert created == {"host": "192.0.2.1", "port": 2100, "identity": "app-id", "psk": "00" * 16}
 
 
-def test_handshake_waits_for_openssl_to_report_it_established():
-    """A slow handshake (the bridge right after an external session stop)
-    used to be declared done after a fixed 1.3s; frames written before the
-    real handshake piled up in the pipe and went out as one oversized
-    datagram (EMSGSIZE), killing the session."""
-    stream = _handshake_stream(
-        "import sys, time; sys.stderr.write('Connecting to x\\n'); sys.stderr.flush();"
-        "time.sleep(1.2); sys.stderr.write('CONNECTION ESTABLISHED\\nProtocol version: DTLSv1.2\\n');"
-        "sys.stderr.flush(); time.sleep(5)"
-    )
-    started = _time.monotonic()
+def test_failed_handshake_returns_false(monkeypatch):
+    import lumux.entertainment as ent
+    from lumux.dtls import DtlsError
 
-    assert stream._wait_for_handshake() is True
-    assert _time.monotonic() - started >= 1.2
-    assert stream._openssl_proc.poll() is None
-    stream._openssl_proc.kill()
+    class FailingClient:
+        def __init__(self, *a, **k):
+            pass
 
+        def connect(self):
+            raise DtlsError("handshake timed out after 5.0s")
 
-def test_handshake_fails_when_openssl_exits_without_establishing():
-    stream = _handshake_stream(
-        "import sys; sys.stderr.write('handshake failure\\n'); sys.exit(1)"
-    )
-
-    assert stream._wait_for_handshake() is False
-
-
-def test_handshake_times_out_and_kills_openssl():
-    stream = _handshake_stream("import time; time.sleep(30)", timeout=0.5)
-    proc = stream._openssl_proc
-    started = _time.monotonic()
-
-    assert stream._wait_for_handshake() is False
-    assert _time.monotonic() - started < 3
-    assert proc.poll() is not None
-
-
-def test_openssl_command_reports_handshake_completion():
+    monkeypatch.setattr(ent, "DtlsPskClient", FailingClient)
     stream, _ = _make_connected_stream()
 
-    cmd = stream._build_openssl_command()
-
-    assert "-brief" in cmd
-    assert "-quiet" not in cmd
-    assert "-ign_eof" in cmd and "-nocommands" in cmd
+    assert stream._establish_dtls_connection() is False

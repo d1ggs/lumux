@@ -5,15 +5,13 @@ low-latency color updates to lights in an entertainment zone using DTLS over UDP
 """
 
 import struct
-import os
-import select
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Dict, Optional, Tuple, TYPE_CHECKING
 
+from lumux.dtls import DtlsError, DtlsPskClient
 from lumux.utils.logging import timed_print
 
 if TYPE_CHECKING:
@@ -78,7 +76,8 @@ class EntertainmentStream:
             client_key: Client key - used as PSK (32-byte hex string)
             entertainment_config_id: ID of the entertainment configuration to stream to
             connection_timeout: Time to wait for DTLS connection (seconds)
-            handshake_delay: Additional time for handshake completion (seconds)
+            handshake_delay: Unused; kept for compatibility (the handshake is now
+                awaited directly, see _handshake_timeout)
         """
         self.bridge_ip = bridge_ip
         self.app_key = app_key
@@ -86,13 +85,13 @@ class EntertainmentStream:
         self.entertainment_config_id = entertainment_config_id
         self._connection_timeout = connection_timeout
         self._handshake_delay = handshake_delay
-        # Upper bound for openssl to report "CONNECTION ESTABLISHED" (see
-        # _wait_for_handshake); normally well under a second.
+        # Upper bound for the DTLS handshake; normally well under a second,
+        # ~1s right after the session was stopped from outside (the bridge
+        # ignores the first ClientHello, the retransmit gets through).
         self._handshake_timeout = 5.0
 
         self._application_id: Optional[str] = None
-        self._openssl_proc: Optional[subprocess.Popen] = None
-        self._dtls_socket = None  # Future: native DTLS implementation
+        self._dtls_socket: Optional[DtlsPskClient] = None
         self._connected = False
         self._sequence = 0
         self._lock = threading.Lock()
@@ -264,25 +263,19 @@ class EntertainmentStream:
             self._light_to_channel[light_rid] = channel_id
 
     def _establish_dtls_connection(self) -> bool:
-        """Establish DTLS-PSK connection to bridge port 2100."""
+        """Establish the DTLS-PSK session to bridge port 2100 (in-process)."""
+        psk_identity = self._application_id or self.app_key
+        client = DtlsPskClient(
+            self.bridge_ip,
+            HueStreamProtocol.PORT,
+            psk_identity,
+            self.client_key,
+            handshake_timeout=self._handshake_timeout,
+        )
         try:
-            cmd = self._build_openssl_command()
-            timed_print(
-                f"Starting DTLS connection: "
-                f"openssl s_client -dtls1_2 -connect {self.bridge_ip}:{HueStreamProtocol.PORT}"
-            )
-
-            self._openssl_proc = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-
-            return self._wait_for_handshake()
-
-        except FileNotFoundError:
-            print("DTLS connection failed: openssl command not found")
+            client.connect()
+        except DtlsError as e:
+            print(f"DTLS connection failed: {e}")
             return False
         except Exception as e:
             print(f"DTLS connection failed: {e}")
@@ -291,122 +284,44 @@ class EntertainmentStream:
             traceback.print_exc()
             return False
 
-    def _build_openssl_command(self) -> list[str]:
-        """Build OpenSSL command for DTLS-PSK connection."""
-        psk_identity = self._application_id or self.app_key
-        return [
-            "openssl",
-            "s_client",
-            "-dtls1_2",
-            "-psk_identity",
-            psk_identity,
-            "-psk",
-            self.client_key,
-            "-cipher",
-            "PSK-AES128-GCM-SHA256:PSK-CHACHA20-POLY1305",
-            "-connect",
-            f"{self.bridge_ip}:{HueStreamProtocol.PORT}",
-            # -brief prints "CONNECTION ESTABLISHED" to stderr once the
-            # handshake is really done (see _wait_for_handshake); unlike
-            # -quiet it doesn't imply these two, which keep binary frames
-            # from being read as EOF / interactive commands.
-            "-brief",
-            "-ign_eof",
-            "-nocommands",
-        ]
-
-    def _wait_for_handshake(self) -> bool:
-        """Wait until openssl reports the DTLS handshake as complete.
-
-        A fixed sleep isn't enough: right after a session was stopped from
-        outside, the bridge can take seconds to answer the handshake. Frames
-        written before it completes pile up in openssl's stdin pipe and are
-        then read and sent as one datagram above the path MTU - openssl
-        fails with EMSGSIZE ("write:errno=90") and exits, so every reconnect
-        died ~0.3s after it was declared established.
-        """
-        proc = self._openssl_proc
-        started = time.monotonic()
-        deadline = started + self._handshake_timeout
-        output = b""
-        fd = proc.stderr.fileno()
-        while b"CONNECTION ESTABLISHED" not in output:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                proc.kill()
-                proc.wait()
-                return self._report_handshake_failure("handshake timeout", output)
-            ready, _, _ = select.select([fd], [], [], remaining)
-            if not ready:
-                continue
-            chunk = os.read(fd, 4096)
-            if not chunk:
-                proc.wait()
-                return self._report_handshake_failure("handshake", output)
-            output += chunk
-
+        self._dtls_socket = client
         timed_print(
             f"DTLS connection established to {self.bridge_ip}:{HueStreamProtocol.PORT} "
-            f"(handshake {time.monotonic() - started:.2f}s)"
+            f"(handshake {client.handshake_seconds:.2f}s)"
         )
         return True
-
-    def _report_handshake_failure(self, stage: str, output: bytes = b"") -> bool:
-        """Report handshake failure; the openssl process has already exited."""
-        if self._openssl_proc:
-            try:
-                _, rest = self._openssl_proc.communicate(timeout=1)
-            except Exception:
-                rest = b""
-            print(f"DTLS {stage} failed (exit code {self._openssl_proc.returncode})")
-            print(f"stderr: {(output + (rest or b'')).decode(errors='replace')}")
-        return False
 
     def disconnect(self, bridge: "HueBridge") -> None:
         """Close DTLS connection and deactivate streaming."""
         self._connected = False
-        self._cleanup_openssl()
+        self._close_dtls()
         self._deactivate_streaming(bridge)
         timed_print("Entertainment stream disconnected")
 
-    def _cleanup_openssl(self) -> None:
-        """Clean up OpenSSL subprocess."""
-        if not self._openssl_proc:
+    def _close_dtls(self) -> None:
+        """Close the DTLS session (sends close_notify if still open)."""
+        if not self._dtls_socket:
             return
-
         try:
-            self._openssl_proc.stdin.close()
-            self._openssl_proc.terminate()
-            self._openssl_proc.wait(timeout=2)
+            self._dtls_socket.close()
         except Exception:
-            try:
-                self._openssl_proc.kill()
-            except Exception:
-                pass
+            pass
         finally:
-            self._openssl_proc = None
+            self._dtls_socket = None
 
     def is_connected(self) -> bool:
         """Check if DTLS connection is active."""
-        if self._openssl_proc:
-            if self._openssl_proc.poll() is None:
+        if self._dtls_socket:
+            if self._dtls_socket.is_open():
                 return self._connected
             if self._connected:
                 self._connected = False
-                self._report_unexpected_exit()
+                timed_print(
+                    "DTLS session ended unexpectedly: "
+                    f"{self._dtls_socket.close_reason or 'unknown reason'}"
+                )
             return False
         return self._connected
-
-    def _report_unexpected_exit(self) -> None:
-        """Log why openssl exited mid-session (e.g. the bridge closed it)."""
-        try:
-            _, stderr = self._openssl_proc.communicate(timeout=1)
-        except Exception as e:
-            stderr = f"<unreadable: {e}>".encode()
-        timed_print(
-            f"DTLS session ended unexpectedly (exit code {self._openssl_proc.returncode}): "
-            f"{(stderr or b'').decode(errors='replace').strip() or '<no stderr>'}"
-        )
 
     def send_colors(self, colors: Dict[int, Tuple[float, float, float, float]]) -> None:
         """Send color update to all channels (RGB format).
@@ -433,8 +348,7 @@ class EntertainmentStream:
         The lamp freezes at its last streamed color for the whole suspend,
         so streaming black over the already-open DTLS socket makes it
         visually dark regardless of any REST-layer race - fire-and-forget
-        write to the local openssl subprocess stdin, no network timeout
-        semantics involved. Guarded by is_connected(); non-fatal on error,
+        non-blocking UDP send, no network timeout semantics involved. Guarded by is_connected(); non-fatal on error,
         same as send_colors().
         """
         if not self.is_connected():
@@ -475,30 +389,13 @@ class EntertainmentStream:
                 self._connected = False
 
     def _send_dtls_message(self, message: bytes) -> None:
-        """Send a message over the DTLS connection."""
-        if self._openssl_proc:
-            self._send_via_openssl(message)
-        elif self._dtls_socket:
-            self._send_via_socket(message)
-        else:
+        """Send a message over the DTLS connection (one record per message)."""
+        if not self._dtls_socket:
             raise ConnectionError("No DTLS connection available")
-
-    def _send_via_openssl(self, message: bytes) -> None:
-        """Send message via OpenSSL subprocess."""
-        try:
-            self._openssl_proc.stdin.write(message)
-            self._openssl_proc.stdin.flush()
-        except (BrokenPipeError, OSError) as e:
-            print(f"DTLS connection lost: {e}")
-            self._connected = False
-            raise
-
-    def _send_via_socket(self, message: bytes) -> None:
-        """Send message via native DTLS socket."""
         try:
             self._dtls_socket.send(message)
-        except OSError as e:
-            print(f"DTLS socket error: {e}")
+        except DtlsError as e:
+            print(f"DTLS connection lost: {e}")
             self._connected = False
             raise
 
