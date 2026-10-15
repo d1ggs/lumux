@@ -77,6 +77,17 @@
   </branding>
 
   <releases>
+    <release version="0.6.12" date="2026-10-15">
+      <description>
+        <p>Capture and pairing fixes (two ported from upstream pull requests):</p>
+        <ul>
+          <li>Switch to another capture method when GPU frames cannot be read (e.g. some AMD/Mesa setups), instead of silently leaving the lights off</li>
+          <li>Remove a capture method that could never work and logged an error at every sync start</li>
+          <li>Bridge pairing waits up to 90 seconds for the link button press</li>
+          <li>Free streaming sessions properly on reconnect and fix a rare crash when stopping sync</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.11" date="2026-10-15">
       <description>
         <p>Keep the bridge key private:</p>
