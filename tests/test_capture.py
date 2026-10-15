@@ -742,3 +742,93 @@ def test_monitor_watcher_tracks_count_changes():
     assert capture._monitor_count == 0
     capture._on_monitors_changed(SimpleNamespace(get_n_items=lambda: 1), 0, 0, 1)
     assert capture._monitor_count == 1
+
+
+# --- Unreadable-frame fallback (ported from upstream PR #24 by max72bra) ---
+
+GL_SCALED = (
+    "pipewiresrc path=7 do-timestamp=true ! glupload ! glcolorconvert ! gldownload ! "
+    "videoscale ! video/x-raw,format=RGB,width=344,height=144 ! appsink name=sink"
+)
+
+
+def _capture_with_active_gl_config():
+    capture = ScreenCapture(source_type="screen")
+    capture._portal_node_id = 7
+    capture._pipeline_running = True
+    capture._active_config_key = ScreenCapture._config_key(GL_SCALED)
+    return capture
+
+
+def _all_elements_available():
+    return patch("lumux.capture.Gst.ElementFactory.find", return_value=object())
+
+
+def test_pipeline_configs_never_use_glcolorscale():
+    """glcolorscale only outputs RGBA, which videoscale can't turn into RGB:
+    that config failed to link at every sync start ("Pipeline config 1
+    exception")."""
+    capture = ScreenCapture(source_type="screen")
+    with _all_elements_available():
+        configs = capture._get_pipeline_configs(7)
+
+    assert configs
+    assert not [c for c in configs if "glcolorscale" in c]
+
+
+def test_few_unmappable_buffers_do_not_switch_converter():
+    capture = _capture_with_active_gl_config()
+
+    for _ in range(4):
+        capture._on_unmappable_buffer("format=RGB, 344x144")
+
+    assert capture._needs_pipeline_restart is False
+    assert capture._runtime_failed_configs == set()
+
+
+def test_repeated_unmappable_buffers_switch_away_from_all_gl_configs():
+    """Broken GL readback (e.g. Mesa/RADV) never errors out: every frame is
+    just dropped and the lights stay off. All glupload variants share the
+    same gldownload readback, so they fail together."""
+    capture = _capture_with_active_gl_config()
+
+    with _all_elements_available():
+        for _ in range(5):
+            capture._on_unmappable_buffer("format=RGB, 344x144")
+        gl_keys = {
+            ScreenCapture._config_key(c)
+            for c in capture._get_pipeline_configs(7)
+            if "glupload" in c
+        }
+
+    assert capture._needs_pipeline_restart is True
+    assert gl_keys and gl_keys <= capture._runtime_failed_configs
+    assert not [k for k in capture._runtime_failed_configs if "glupload" not in k]
+
+
+def test_sporadic_unmappable_buffers_outside_window_are_ignored():
+    capture = _capture_with_active_gl_config()
+    times = iter([0.0, 1.0, 2.5, 3.5, 5.0, 6.0])
+
+    with patch("lumux.capture.time.monotonic", side_effect=lambda: next(times)):
+        for _ in range(6):
+            capture._on_unmappable_buffer("format=RGB, 344x144")
+
+    assert capture._needs_pipeline_restart is False
+
+
+def test_downstream_dropped_frame_warning_counts_as_unmappable():
+    """videoscale (after gldownload) drops unreadable frames with this
+    warning, so they never reach the appsink map() check."""
+    capture = _capture_with_active_gl_config()
+    warning = SimpleNamespace(
+        parse_warning=lambda: (
+            SimpleNamespace(message="Internal data stream error."),
+            "../gst/videoscale.c(123): invalid video buffer received",
+        )
+    )
+
+    for _ in range(5):
+        capture._on_pipeline_warning(None, warning)
+
+    assert capture._needs_pipeline_restart is True
