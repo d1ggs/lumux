@@ -69,6 +69,16 @@ class SyncController:
         # dead (see _ensure_entertainment_connected).
         self._next_entertainment_retry = 0.0
         self._entertainment_retry_interval = 5.0
+        # Before reconnecting a dropped stream, wait this long and then ask
+        # the bridge whether the zone's lights are switched off. A stream
+        # stopped from outside (HA, Hue app) followed by "lights off" means
+        # the user wants them dark: reconnecting would start a fresh
+        # session, which overrides the off state. The grace period gives
+        # that "off" command time to land after the stop.
+        self._reconnect_grace = 3.0
+        self._disconnected_since: Optional[float] = None
+        self._paused_by_lights_off = False
+        self._lights_off_poll_interval = 3.0
 
         self._stats = {
             "fps": 0,
@@ -432,20 +442,51 @@ class SyncController:
             return False
         with self.lock:
             if self.entertainment_stream.is_connected():
+                self._disconnected_since = None
                 return True
-            if time.monotonic() < self._next_entertainment_retry:
+            now = time.monotonic()
+            if self._disconnected_since is None:
+                self._disconnected_since = now
+            if now - self._disconnected_since < self._reconnect_grace:
                 return False
+            if now < self._next_entertainment_retry:
+                return False
+            if self._lights_switched_off():
+                if not self._paused_by_lights_off:
+                    timed_print(
+                        "Entertainment stream stopped and lights switched off "
+                        "externally; pausing until they are switched back on"
+                    )
+                    self._paused_by_lights_off = True
+                self._next_entertainment_retry = now + self._lights_off_poll_interval
+                return False
+            if self._paused_by_lights_off:
+                timed_print("Lights switched back on; resuming entertainment stream")
+                self._paused_by_lights_off = False
             if not self.bridge or not self.entertainment_stream.connect(self.bridge):
                 self._next_entertainment_retry = (
                     time.monotonic() + self._entertainment_retry_interval
                 )
                 return False
             self._next_entertainment_retry = 0.0
+            self._disconnected_since = None
         # The zone-channel map built in start() is still valid: it's keyed
         # off physical channel positions, which a reconnect to the same
         # entertainment config does not change.
         timed_print("Entertainment stream reconnected")
         return True
+
+    def _lights_switched_off(self) -> bool:
+        """Whether the bridge reports every zone light off (fails open)."""
+        check = getattr(self.bridge, "entertainment_lights_off", None)
+        config_id = getattr(self.entertainment_stream, "entertainment_config_id", None)
+        if not check or not config_id:
+            return False
+        try:
+            return bool(check(config_id))
+        except Exception as e:
+            timed_print(f"Could not read light state, reconnecting anyway: {e}")
+            return False
 
     def _queue_status(self, status_type: str, message, data=None):
         """Queue status update for GUI thread."""

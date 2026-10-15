@@ -17,6 +17,7 @@ class FakeStream:
         self._connected = connected
         self.connect_succeeds = connect_succeeds
         self.connect_calls = 0
+        self.entertainment_config_id = "cfg"
 
     def is_connected(self):
         return self._connected
@@ -40,12 +41,18 @@ class FakeSettings:
 
 
 class FakeBridge:
-    pass
+    def __init__(self, lights_off=False):
+        self.lights_off = lights_off
+        self.lights_off_calls = 0
+
+    def entertainment_lights_off(self, config_id):
+        self.lights_off_calls += 1
+        return self.lights_off
 
 
-def _controller(stream):
-    return SyncController(
-        bridge=FakeBridge(),
+def _controller(stream, bridge=None, reconnect_grace=0.0):
+    controller = SyncController(
+        bridge=bridge or FakeBridge(),
         capture=FakeCapture(),
         zone_processor=None,
         color_analyzer=None,
@@ -53,6 +60,8 @@ def _controller(stream):
         settings=FakeSettings(),
         entertainment_stream=stream,
     )
+    controller._reconnect_grace = reconnect_grace
+    return controller
 
 
 COLORS = {1: ((0.3, 0.3), 120)}
@@ -197,3 +206,88 @@ def test_keepalive_reconnects_and_resends_last_frame():
 
     assert stream.connect_calls == 1
     assert stream.sent == [COLORS]
+
+
+def _drop(stream):
+    stream._connected = False
+
+
+def test_no_reconnect_during_grace_period_after_stream_drops():
+    """Gives HA/the Hue app time to switch the lights off after stopping
+    the session, before deciding whether the drop was deliberate."""
+    stream = FakeStream(connected=True)
+    controller = _controller(stream, reconnect_grace=3.0)
+    controller._zone_channel_map = {"z1": 1}
+    controller._update_lights({"z1": ((0.3, 0.3), 120)})
+    _drop(stream)
+
+    controller._update_lights({"z1": ((0.3, 0.3), 120)})
+
+    assert stream.connect_calls == 0
+
+
+def test_reconnects_after_grace_when_lights_still_on():
+    stream = FakeStream(connected=True)
+    controller = _controller(stream, reconnect_grace=3.0)
+    controller._zone_channel_map = {"z1": 1}
+    _drop(stream)
+    controller._update_lights({"z1": ((0.3, 0.3), 120)})
+    controller._disconnected_since -= 3.1
+
+    controller._update_lights({"z1": ((0.3, 0.3), 120)})
+
+    assert stream.connect_calls == 1
+
+
+def test_stays_paused_when_lights_switched_off_externally():
+    """Someone stopped the session and switched the lights off (HA, Hue
+    app): reconnecting would start a fresh session that overrides that."""
+    stream = FakeStream(connected=False)
+    bridge = FakeBridge(lights_off=True)
+    controller = _controller(stream, bridge=bridge)
+    controller._zone_channel_map = {"z1": 1}
+
+    controller._update_lights({"z1": ((0.3, 0.3), 120)})
+
+    assert bridge.lights_off_calls == 1
+    assert stream.connect_calls == 0
+    assert stream.sent == []
+
+
+def test_paused_check_is_rate_limited():
+    stream = FakeStream(connected=False)
+    bridge = FakeBridge(lights_off=True)
+    controller = _controller(stream, bridge=bridge)
+    controller._zone_channel_map = {"z1": 1}
+
+    controller._update_lights({"z1": ((0.3, 0.3), 120)})
+    controller._update_lights({"z1": ((0.3, 0.3), 120)})
+
+    assert bridge.lights_off_calls == 1
+
+
+def test_resumes_when_lights_switched_back_on():
+    stream = FakeStream(connected=False)
+    bridge = FakeBridge(lights_off=True)
+    controller = _controller(stream, bridge=bridge)
+    controller._zone_channel_map = {"z1": 1}
+    controller._update_lights({"z1": ((0.3, 0.3), 120)})
+
+    bridge.lights_off = False
+    controller._next_entertainment_retry = 0.0
+    controller._update_lights({"z1": ((0.3, 0.3), 120)})
+
+    assert stream.connect_calls == 1
+    assert stream.sent == [COLORS]
+
+
+def test_keepalive_does_not_reconnect_while_lights_switched_off():
+    stream = FakeStream(connected=False)
+    controller = _controller(stream, bridge=FakeBridge(lights_off=True))
+    controller._last_channel_colors = COLORS
+    controller._last_send_time = time.monotonic() - 6.0
+
+    controller._maybe_send_keepalive()
+
+    assert stream.connect_calls == 0
+    assert stream.sent == []

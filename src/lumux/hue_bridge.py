@@ -36,6 +36,8 @@ class HueBridge:
         self.lights: Dict[str, dict] = {}
         self.zones: Dict[str, dict] = {}
         self.light_info: Dict[str, dict] = {}
+        # config_id -> light ids, for entertainment_lights_off() polling.
+        self._entertainment_light_ids: Dict[str, List[str]] = {}
 
     @property
     def client(self) -> Optional[BridgeClient]:
@@ -625,6 +627,29 @@ class HueBridge:
         except BridgeError as e:
             print(f"Error resolving entertainment light IDs: {e}")
             return []
+
+    def entertainment_lights_off(self, config_id: str) -> bool:
+        """True only if every light in the entertainment zone is switched off.
+
+        Used to tell a deliberate stop (session stopped, then lights
+        switched off from HA/the Hue app) from a network drop. Fails open:
+        any error or unreadable state returns False, so sync reconnects.
+        """
+        try:
+            light_ids = self._entertainment_light_ids.get(config_id)
+            if not light_ids:
+                light_ids = self.get_entertainment_light_ids(config_id)
+                if not light_ids:
+                    return False
+                self._entertainment_light_ids[config_id] = light_ids
+            for light_id in light_ids:
+                light = self.client.get_light(light_id) if self.client else None
+                if not light or light.get("on", {}).get("on", True):
+                    return False
+            return True
+        except BridgeError as e:
+            print(f"Error reading entertainment light state: {e}")
+            return False
 
     def activate_entertainment_streaming(self, config_id: str) -> bool:
         """Activate entertainment streaming for a configuration."""
