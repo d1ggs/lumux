@@ -5,6 +5,8 @@ low-latency color updates to lights in an entertainment zone using DTLS over UDP
 """
 
 import struct
+import os
+import select
 import subprocess
 import threading
 import time
@@ -84,6 +86,9 @@ class EntertainmentStream:
         self.entertainment_config_id = entertainment_config_id
         self._connection_timeout = connection_timeout
         self._handshake_delay = handshake_delay
+        # Upper bound for openssl to report "CONNECTION ESTABLISHED" (see
+        # _wait_for_handshake); normally well under a second.
+        self._handshake_timeout = 5.0
 
         self._application_id: Optional[str] = None
         self._openssl_proc: Optional[subprocess.Popen] = None
@@ -301,32 +306,60 @@ class EntertainmentStream:
             "PSK-AES128-GCM-SHA256:PSK-CHACHA20-POLY1305",
             "-connect",
             f"{self.bridge_ip}:{HueStreamProtocol.PORT}",
-            "-quiet",
+            # -brief prints "CONNECTION ESTABLISHED" to stderr once the
+            # handshake is really done (see _wait_for_handshake); unlike
+            # -quiet it doesn't imply these two, which keep binary frames
+            # from being read as EOF / interactive commands.
+            "-brief",
+            "-ign_eof",
+            "-nocommands",
         ]
 
     def _wait_for_handshake(self) -> bool:
-        """Wait for DTLS handshake to complete."""
-        time.sleep(self._connection_timeout)
+        """Wait until openssl reports the DTLS handshake as complete.
 
-        if self._openssl_proc.poll() is not None:
-            return self._report_handshake_failure("initial connection")
-
-        time.sleep(self._handshake_delay)
-
-        if self._openssl_proc.poll() is not None:
-            return self._report_handshake_failure("handshake")
+        A fixed sleep isn't enough: right after a session was stopped from
+        outside, the bridge can take seconds to answer the handshake. Frames
+        written before it completes pile up in openssl's stdin pipe and are
+        then read and sent as one datagram above the path MTU - openssl
+        fails with EMSGSIZE ("write:errno=90") and exits, so every reconnect
+        died ~0.3s after it was declared established.
+        """
+        proc = self._openssl_proc
+        started = time.monotonic()
+        deadline = started + self._handshake_timeout
+        output = b""
+        fd = proc.stderr.fileno()
+        while b"CONNECTION ESTABLISHED" not in output:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                proc.wait()
+                return self._report_handshake_failure("handshake timeout", output)
+            ready, _, _ = select.select([fd], [], [], remaining)
+            if not ready:
+                continue
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                proc.wait()
+                return self._report_handshake_failure("handshake", output)
+            output += chunk
 
         timed_print(
-            f"DTLS connection established to {self.bridge_ip}:{HueStreamProtocol.PORT}"
+            f"DTLS connection established to {self.bridge_ip}:{HueStreamProtocol.PORT} "
+            f"(handshake {time.monotonic() - started:.2f}s)"
         )
         return True
 
-    def _report_handshake_failure(self, stage: str) -> bool:
-        """Report handshake failure and cleanup."""
+    def _report_handshake_failure(self, stage: str, output: bytes = b"") -> bool:
+        """Report handshake failure; the openssl process has already exited."""
         if self._openssl_proc:
-            stdout, stderr = self._openssl_proc.communicate()
+            try:
+                _, rest = self._openssl_proc.communicate(timeout=1)
+            except Exception:
+                rest = b""
             print(f"DTLS {stage} failed (exit code {self._openssl_proc.returncode})")
-            print(f"stderr: {stderr.decode()}")
+            print(f"stderr: {(output + (rest or b'')).decode(errors='replace')}")
         return False
 
     def disconnect(self, bridge: "HueBridge") -> None:
@@ -356,8 +389,24 @@ class EntertainmentStream:
     def is_connected(self) -> bool:
         """Check if DTLS connection is active."""
         if self._openssl_proc:
-            return self._connected and self._openssl_proc.poll() is None
+            if self._openssl_proc.poll() is None:
+                return self._connected
+            if self._connected:
+                self._connected = False
+                self._report_unexpected_exit()
+            return False
         return self._connected
+
+    def _report_unexpected_exit(self) -> None:
+        """Log why openssl exited mid-session (e.g. the bridge closed it)."""
+        try:
+            _, stderr = self._openssl_proc.communicate(timeout=1)
+        except Exception as e:
+            stderr = f"<unreadable: {e}>".encode()
+        timed_print(
+            f"DTLS session ended unexpectedly (exit code {self._openssl_proc.returncode}): "
+            f"{(stderr or b'').decode(errors='replace').strip() or '<no stderr>'}"
+        )
 
     def send_colors(self, colors: Dict[int, Tuple[float, float, float, float]]) -> None:
         """Send color update to all channels (RGB format).

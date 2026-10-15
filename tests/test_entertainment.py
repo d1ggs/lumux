@@ -84,3 +84,103 @@ def test_send_colors_xy_still_works_without_blackout():
     stream.send_colors_xy({0: ((0.5, 0.4), 200), 1: ((0.2, 0.3), 100)})
 
     assert len(sent) == 1
+
+
+class _ExitedProc:
+    returncode = 1
+
+    def __init__(self, stderr=b"SSL3 alert read:fatal:handshake failure\n"):
+        self._stderr = stderr
+        self.communicate_calls = 0
+
+    def poll(self):
+        return self.returncode
+
+    def communicate(self, timeout=None):
+        self.communicate_calls += 1
+        return b"", self._stderr
+
+
+def test_unexpected_dtls_exit_is_logged_once(capsys):
+    """A bridge-side session kill used to be invisible: only the next
+    reconnect showed up in the log, never why the old session died."""
+    stream, _ = _make_connected_stream()
+    proc = _ExitedProc()
+    stream._openssl_proc = proc
+
+    assert stream.is_connected() is False
+    assert stream.is_connected() is False
+
+    out = capsys.readouterr().out
+    assert out.count("DTLS session ended unexpectedly (exit code 1)") == 1
+    assert "handshake failure" in out
+    assert proc.communicate_calls == 1
+
+
+import subprocess
+import sys
+import time as _time
+
+
+def _fake_openssl(script):
+    """Real subprocess standing in for openssl s_client (stderr protocol)."""
+    return subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _handshake_stream(script, timeout=2.0):
+    stream, _ = _make_connected_stream()
+    stream._connected = False
+    stream._handshake_timeout = timeout
+    stream._openssl_proc = _fake_openssl(script)
+    return stream
+
+
+def test_handshake_waits_for_openssl_to_report_it_established():
+    """A slow handshake (the bridge right after an external session stop)
+    used to be declared done after a fixed 1.3s; frames written before the
+    real handshake piled up in the pipe and went out as one oversized
+    datagram (EMSGSIZE), killing the session."""
+    stream = _handshake_stream(
+        "import sys, time; sys.stderr.write('Connecting to x\\n'); sys.stderr.flush();"
+        "time.sleep(1.2); sys.stderr.write('CONNECTION ESTABLISHED\\nProtocol version: DTLSv1.2\\n');"
+        "sys.stderr.flush(); time.sleep(5)"
+    )
+    started = _time.monotonic()
+
+    assert stream._wait_for_handshake() is True
+    assert _time.monotonic() - started >= 1.2
+    assert stream._openssl_proc.poll() is None
+    stream._openssl_proc.kill()
+
+
+def test_handshake_fails_when_openssl_exits_without_establishing():
+    stream = _handshake_stream(
+        "import sys; sys.stderr.write('handshake failure\\n'); sys.exit(1)"
+    )
+
+    assert stream._wait_for_handshake() is False
+
+
+def test_handshake_times_out_and_kills_openssl():
+    stream = _handshake_stream("import time; time.sleep(30)", timeout=0.5)
+    proc = stream._openssl_proc
+    started = _time.monotonic()
+
+    assert stream._wait_for_handshake() is False
+    assert _time.monotonic() - started < 3
+    assert proc.poll() is not None
+
+
+def test_openssl_command_reports_handshake_completion():
+    stream, _ = _make_connected_stream()
+
+    cmd = stream._build_openssl_command()
+
+    assert "-brief" in cmd
+    assert "-quiet" not in cmd
+    assert "-ign_eof" in cmd and "-nocommands" in cmd
