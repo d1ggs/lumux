@@ -77,6 +77,15 @@
   </branding>
 
   <releases>
+    <release version="0.6.11" date="2026-10-15">
+      <description>
+        <p>Keep the bridge key private:</p>
+        <ul>
+          <li>The DTLS streaming connection now runs inside Lumux instead of an openssl helper process, whose command line exposed the bridge's client key to every local process</li>
+          <li>Each color frame is sent as exactly one packet, and a session ended by the bridge is detected immediately</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.10" date="2026-10-15">
       <description>
         <p>Turn the lights off from Home Assistant or the Hue app while syncing, and more reliable reconnects:</p>
